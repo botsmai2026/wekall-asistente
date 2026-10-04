@@ -1,0 +1,76 @@
+# docker compose up --build
+#
+# Levanta todo: PostgreSQL (con pgvector), MongoDB, la preparación de la base
+# (esquema, datos de ejemplo y documentos), la API con la interfaz web y el worker.
+# Para que el asistente responda hace falta un archivo .env con OPENAI_API_KEY
+# (ver .env.example). Sin la clave arrancan las bases, la API y la interfaz,
+# pero no se cargan los documentos y el worker no arranca: los mensajes quedan en cola.
+
+x-app: &app
+  build: .
+  environment: &entorno
+    POSTGRES_URL: postgres://postgres:postgres@postgres:5432/asistente
+    MONGO_URL: mongodb://mongo:27017
+    CLINICA_ID: "1"
+    OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    OPENAI_MODELO: ${OPENAI_MODELO:-gpt-4o-mini}
+    OPENAI_MODELO_EMBEDDINGS: ${OPENAI_MODELO_EMBEDDINGS:-text-embedding-3-small}
+    OPENAI_VENTANA_CONTEXTO: ${OPENAI_VENTANA_CONTEXTO:-128000}
+    OPENAI_TEMPERATURA: ${OPENAI_TEMPERATURA:-0.1}
+    OPENAI_ESFUERZO_RAZONAMIENTO: ${OPENAI_ESFUERZO_RAZONAMIENTO:-}
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: asistente
+    ports: ["5432:5432"]
+    volumes:
+      - datos_postgres:/var/lib/postgresql/data
+      - ./docker/crear-base-de-pruebas.sql:/docker-entrypoint-initdb.d/crear-base-de-pruebas.sql:ro
+    healthcheck:
+      # Con -h se comprueba por red: durante la inicialización Postgres solo escucha en su socket local.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d asistente"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  mongo:
+    image: mongo:7
+    ports: ["27017:27017"]
+    volumes:
+      - datos_mongo:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Corre una vez y termina: crea el esquema, los datos de ejemplo y el conocimiento.
+  preparar:
+    <<: *app
+    command: ["node", "dist/preparar.js"]
+    restart: "on-failure:5"
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  api:
+    <<: *app
+    command: ["node", "dist/main-api.js"]
+    restart: on-failure
+    ports: ["3000:3000"]
+    depends_on:
+      preparar: { condition: service_completed_successfully }
+    # Mongo no es una dependencia de arranque: la API funciona aunque esté caído.
+
+  worker:
+    <<: *app
+    command: ["node", "dist/main-worker.js"]
+    restart: "on-failure:5"
+    depends_on:
+      preparar: { condition: service_completed_successfully }
+
+volumes:
+  datos_postgres:
+  datos_mongo:

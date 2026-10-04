@@ -1,0 +1,32 @@
+{
+  "name": "wekall-asistente",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "api": "tsx src/main-api.ts",
+    "worker": "tsx src/main-worker.ts",
+    "preparar": "tsx src/preparar.ts",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@fastify/static": "^10.1.5",
+    "@sinclair/typebox": "^0.34.0",
+    "fastify": "^5.0.0",
+    "mongodb": "^6.10.0",
+    "openai": "^4.70.0",
+    "pg": "^8.13.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.11.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^5.0.3"
+  }
+}

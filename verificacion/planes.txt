@@ -1,0 +1,433 @@
+== reclamo ==
+Limit  (cost=164.30..196.22 rows=1 width=102) (actual time=0.174..0.176 rows=1 loops=1)
+  Buffers: shared hit=14 read=1
+  CTE ocupadas
+    ->  GroupAggregate  (cost=0.14..163.34 rows=3 width=16) (actual time=0.084..0.085 rows=1 loops=1)
+          Group Key: conversaciones.clinica_id
+          Buffers: shared hit=5
+          ->  Index Only Scan using conversaciones_en_proceso on conversaciones  (cost=0.14..162.87 rows=87 width=8) (actual time=0.019..0.071 rows=142 loops=1)
+                Index Cond: (procesando_hasta >= '2026-10-04 14:03:35.539342-05'::timestamp with time zone)
+                Heap Fetches: 146
+                Buffers: shared hit=5
+  ->  LockRows  (cost=0.97..3543.87 rows=111 width=102) (actual time=0.174..0.175 rows=1 loops=1)
+        Buffers: shared hit=14 read=1
+        ->  Nested Loop Anti Join  (cost=0.97..3542.76 rows=111 width=102) (actual time=0.164..0.165 rows=1 loops=1)
+              Buffers: shared hit=13 read=1
+              ->  Nested Loop Left Join  (cost=0.69..3059.31 rows=111 width=96) (actual time=0.149..0.149 rows=1 loops=1)
+                    Join Filter: (o.clinica_id = c.clinica_id)
+                    Filter: (COALESCE(o.en_proceso, '0'::bigint) < 1000)
+                    Buffers: shared hit=11 read=1
+                    ->  Nested Loop  (cost=0.69..3034.23 rows=334 width=56) (actual time=0.040..0.041 rows=1 loops=1)
+                          Buffers: shared hit=6 read=1
+                          ->  Index Scan using mensajes_cola_listos on mensajes_entrantes m  (cost=0.27..611.26 rows=334 width=42) (actual time=0.017..0.018 rows=1 loops=1)
+                                Index Cond: (proximo_intento_en <= '2026-10-04 14:03:35.539342-05'::timestamp with time zone)
+                                Filter: (estado = ANY ('{pendiente,procesando}'::text[]))
+                                Buffers: shared hit=3
+                          ->  Index Scan using conversaciones_pkey on conversaciones c  (cost=0.42..7.25 rows=1 width=22) (actual time=0.021..0.021 rows=1 loops=1)
+                                Index Cond: (id = m.conversacion_id)
+                                Filter: ((procesando_hasta IS NULL) OR (procesando_hasta < '2026-10-04 14:03:35.539342-05'::timestamp with time zone))
+                                Buffers: shared hit=3 read=1
+                    ->  CTE Scan on ocupadas o  (cost=0.00..0.06 rows=3 width=56) (actual time=0.106..0.106 rows=1 loops=1)
+                          Buffers: shared hit=5
+              ->  Index Scan using mensajes_cola on mensajes_entrantes anterior  (cost=0.27..4.32 rows=1 width=22) (actual time=0.014..0.014 rows=0 loops=1)
+                    Index Cond: ((conversacion_id = m.conversacion_id) AND (secuencia < m.secuencia))
+                    Filter: (estado = ANY ('{pendiente,procesando}'::text[]))
+                    Buffers: shared hit=2
+Planning:
+  Buffers: shared hit=453 read=8
+Planning Time: 1.408 ms
+Execution Time: 0.265 ms
+
+== limite ==
+Aggregate  (cost=8.45..8.46 rows=1 width=8) (actual time=0.032..0.032 rows=1 loops=1)
+  Buffers: shared hit=5 read=1
+  ->  Index Only Scan using mensajes_recibidos on mensajes_entrantes  (cost=0.43..8.45 rows=1 width=0) (actual time=0.031..0.031 rows=0 loops=1)
+        Index Cond: ((conversacion_id = 5179) AND (recibido_en > ('2026-10-04 14:03:35.545901-05'::timestamp with time zone - '00:01:00'::interval)))
+        Heap Fetches: 0
+        Buffers: shared hit=5 read=1
+Planning:
+  Buffers: shared hit=173
+Planning Time: 0.428 ms
+Execution Time: 0.052 ms
+
+== bandeja ==
+Limit  (cost=0.42..7.77 rows=50 width=58) (actual time=0.047..0.075 rows=50 loops=1)
+  Buffers: shared hit=53 read=2
+  ->  Index Scan using conversaciones_bandeja on conversaciones  (cost=0.42..5974.28 rows=40616 width=58) (actual time=0.046..0.070 rows=50 loops=1)
+        Index Cond: ((clinica_id = 1) AND (estado = 'escalada'::text))
+        Buffers: shared hit=53 read=2
+Planning:
+  Buffers: shared hit=183
+Planning Time: 0.387 ms
+Execution Time: 0.094 ms
+
+== historial ==
+Sort  (cost=24.20..24.21 rows=5 width=27) (actual time=0.084..0.085 rows=5 loops=1)
+  Sort Key: mensajes_entrantes.secuencia
+  Sort Method: quicksort  Memory: 25kB
+  Buffers: shared hit=10 read=5
+  ->  Limit  (cost=0.42..24.14 rows=5 width=27) (actual time=0.036..0.063 rows=5 loops=1)
+        Buffers: shared hit=7 read=5
+        ->  Index Scan Backward using mensajes_historial on mensajes_entrantes  (cost=0.42..24.14 rows=5 width=27) (actual time=0.035..0.061 rows=5 loops=1)
+              Index Cond: (conversacion_id = 5179)
+              Filter: (estado = ANY ('{procesado,fallido}'::text[]))
+              Buffers: shared hit=7 read=5
+Planning:
+  Buffers: shared hit=252
+Planning Time: 0.525 ms
+Execution Time: 0.102 ms
+
+== disponibilidad ==
+Limit  (cost=290.89..290.91 rows=8 width=34) (actual time=1.308..1.311 rows=8 loops=1)
+  Buffers: shared hit=5 read=91 dirtied=1 written=2
+  ->  Sort  (cost=290.89..291.20 rows=126 width=34) (actual time=1.307..1.309 rows=8 loops=1)
+        Sort Key: s.inicia_en
+        Sort Method: top-N heapsort  Memory: 25kB
+        Buffers: shared hit=5 read=91 dirtied=1 written=2
+        ->  Nested Loop Anti Join  (cost=2.08..288.37 rows=126 width=34) (actual time=0.250..1.273 rows=128 loops=1)
+              Join Filter: (ci.slot_id = s.id)
+              Rows Removed by Join Filter: 256
+              Buffers: shared hit=2 read=91 dirtied=1 written=2
+              ->  Hash Join  (cost=1.96..282.33 rows=126 width=34) (actual time=0.227..1.200 rows=128 loops=1)
+                    Hash Cond: (s.profesional_id = p.id)
+                    Buffers: shared hit=1 read=90 written=2
+                    ->  Seq Scan on slots s  (cost=0.00..278.18 rows=770 width=24) (actual time=0.192..1.102 rows=769 loops=1)
+                          Filter: ((inicia_en >= '2026-10-07 00:00:00-05'::timestamp with time zone) AND (inicia_en < '2026-10-08 00:00:00-05'::timestamp with time zone) AND (inicia_en > '2026-10-04 14:03:35.557825-05'::timestamp with time zone))
+                          Rows Removed by Filter: 9984
+                          Buffers: shared hit=1 read=89 written=2
+                    ->  Hash  (cost=1.86..1.86 rows=8 width=26) (actual time=0.020..0.021 rows=8 loops=1)
+                          Buckets: 1024  Batches: 1  Memory Usage: 9kB
+                          Buffers: shared read=1
+                          ->  Seq Scan on profesionales p  (cost=0.00..1.86 rows=8 width=26) (actual time=0.010..0.013 rows=8 loops=1)
+                                Filter: ((clinica_id = 1) AND (especialidad_id = 1) AND (sede_id = 1))
+                                Rows Removed by Filter: 41
+                                Buffers: shared read=1
+              ->  Materialize  (cost=0.12..4.14 rows=1 width=8) (actual time=0.000..0.000 rows=2 loops=128)
+                    Buffers: shared hit=1 read=1 dirtied=1
+                    ->  Index Only Scan using citas_un_slot_una_cita_activa on citas ci  (cost=0.12..4.14 rows=1 width=8) (actual time=0.018..0.019 rows=2 loops=1)
+                          Heap Fetches: 3
+                          Buffers: shared hit=1 read=1 dirtied=1
+Planning:
+  Buffers: shared hit=388 read=11
+Planning Time: 0.904 ms
+Execution Time: 1.348 ms
+
+== busqueda_vectorial ==
+Limit  (cost=118.79..118.80 rows=4 width=44) (actual time=3.890..3.892 rows=4 loops=1)
+  Buffers: shared hit=917 read=417 written=11
+  ->  Sort  (cost=118.79..119.29 rows=200 width=44) (actual time=3.889..3.890 rows=4 loops=1)
+        Sort Key: ((embedding <=> '[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0.57735,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0.57735,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0.57735,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]'::vector))
+        Sort Method: top-N heapsort  Memory: 25kB
+        Buffers: shared hit=917 read=417 written=11
+        ->  Bitmap Heap Scan on fragmentos_conocimiento f  (cost=6.33..115.79 rows=200 width=44) (actual time=0.121..3.823 rows=200 loops=1)
+              Recheck Cond: ((clinica_id = 32) AND (modelo_embedding = 'm'::text))
+              Heap Blocks: exact=103
+              Buffers: shared hit=914 read=417 written=11
+              ->  Bitmap Index Scan on fragmentos_por_clinica_y_modelo  (cost=0.00..6.29 rows=200 width=0) (actual time=0.027..0.027 rows=200 loops=1)
+                    Index Cond: ((clinica_id = 32) AND (modelo_embedding = 'm'::text))
+                    Buffers: shared hit=3 read=2
+Planning:
+  Buffers: shared hit=169 read=3
+Planning Time: 0.377 ms
+Execution Time: 3.935 ms
+
+== outbox ==
+Limit  (cost=0.15..0.32 rows=1 width=75) (actual time=0.053..0.053 rows=1 loops=1)
+  Buffers: shared hit=1 read=2 dirtied=1 written=1
+  ->  LockRows  (cost=0.15..46.88 rows=275 width=75) (actual time=0.052..0.053 rows=1 loops=1)
+        Buffers: shared hit=1 read=2 dirtied=1 written=1
+        ->  Index Scan using trazas_por_publicar on trazas_pendientes  (cost=0.15..44.13 rows=275 width=75) (actual time=0.035..0.035 rows=1 loops=1)
+              Filter: (estado_envio = 'pendiente'::text)
+              Buffers: shared read=2 written=1
+Planning:
+  Buffers: shared hit=114 read=3
+Planning Time: 0.353 ms
+Execution Time: 0.077 ms
+
+== cita_propia ==
+Merge Join  (cost=9.16..9.29 rows=1 width=50) (actual time=0.102..0.110 rows=1 loops=1)
+  Merge Cond: (s.id = ci.slot_id)
+  Buffers: shared hit=11 read=6
+  ->  Nested Loop  (cost=0.72..1145.97 rows=10753 width=42) (actual time=0.068..0.075 rows=2 loops=1)
+        Buffers: shared hit=7 read=6
+        ->  Nested Loop  (cost=0.58..899.54 rows=10753 width=39) (actual time=0.057..0.062 rows=2 loops=1)
+              Buffers: shared hit=4 read=5
+              ->  Nested Loop  (cost=0.44..656.16 rows=10753 width=42) (actual time=0.037..0.040 rows=2 loops=1)
+                    Buffers: shared hit=4 read=3
+                    ->  Index Scan using slots_pkey on slots s  (cost=0.29..382.58 rows=10753 width=24) (actual time=0.017..0.018 rows=2 loops=1)
+                          Buffers: shared hit=1 read=2
+                    ->  Memoize  (cost=0.15..0.17 rows=1 width=34) (actual time=0.010..0.010 rows=1 loops=2)
+                          Cache Key: s.profesional_id
+                          Cache Mode: logical
+                          Hits: 0  Misses: 2  Evictions: 0  Overflows: 0  Memory Usage: 1kB
+                          Buffers: shared hit=3 read=1
+                          ->  Index Scan using profesionales_id_clinica_id_key on profesionales p  (cost=0.14..0.16 rows=1 width=34) (actual time=0.007..0.007 rows=1 loops=2)
+                                Index Cond: (id = s.profesional_id)
+                                Buffers: shared hit=3 read=1
+              ->  Memoize  (cost=0.14..0.40 rows=1 width=13) (actual time=0.010..0.010 rows=1 loops=2)
+                    Cache Key: p.sede_id
+                    Cache Mode: logical
+                    Hits: 1  Misses: 1  Evictions: 0  Overflows: 0  Memory Usage: 1kB
+                    Buffers: shared read=2
+                    ->  Index Scan using sedes_id_clinica_id_key on sedes se  (cost=0.13..0.39 rows=1 width=13) (actual time=0.019..0.019 rows=1 loops=1)
+                          Index Cond: (id = p.sede_id)
+                          Buffers: shared read=2
+        ->  Memoize  (cost=0.14..0.40 rows=1 width=19) (actual time=0.006..0.006 rows=1 loops=2)
+              Cache Key: p.especialidad_id
+              Cache Mode: logical
+              Hits: 0  Misses: 2  Evictions: 0  Overflows: 0  Memory Usage: 1kB
+              Buffers: shared hit=3 read=1
+              ->  Index Scan using especialidades_id_clinica_id_key on especialidades e  (cost=0.13..0.39 rows=1 width=19) (actual time=0.005..0.005 rows=1 loops=2)
+                    Index Cond: (id = p.especialidad_id)
+                    Buffers: shared hit=3 read=1
+  ->  Sort  (cost=8.45..8.45 rows=1 width=16) (actual time=0.031..0.032 rows=1 loops=1)
+        Sort Key: ci.slot_id
+        Sort Method: quicksort  Memory: 25kB
+        Buffers: shared hit=4
+        ->  Index Scan using citas_un_mensaje_una_cita on citas ci  (cost=0.42..8.44 rows=1 width=16) (actual time=0.022..0.023 rows=1 loops=1)
+              Index Cond: (source_message_id = 'b.1'::text)
+              Buffers: shared hit=4
+Planning:
+  Buffers: shared hit=500 read=3
+Planning Time: 1.288 ms
+Execution Time: 0.217 ms
+
+== reclamo_con_atraso ==
+Limit  (cost=164.33..174.24 rows=1 width=102) (actual time=0.195..0.196 rows=1 loops=1)
+  Buffers: shared hit=9 read=5
+  CTE ocupadas
+    ->  GroupAggregate  (cost=0.14..163.34 rows=3 width=16) (actual time=0.078..0.079 rows=1 loops=1)
+          Group Key: conversaciones.clinica_id
+          Buffers: shared hit=3 read=1
+          ->  Index Only Scan using conversaciones_en_proceso on conversaciones  (cost=0.14..162.87 rows=87 width=8) (actual time=0.026..0.061 rows=142 loops=1)
+                Index Cond: (procesando_hasta >= '2026-10-04 14:03:36.120885-05'::timestamp with time zone)
+                Heap Fetches: 142
+                Buffers: shared hit=3 read=1
+  ->  LockRows  (cost=0.99..64738.88 rows=6534 width=102) (actual time=0.194..0.195 rows=1 loops=1)
+        Buffers: shared hit=9 read=5
+        ->  Nested Loop Anti Join  (cost=0.99..64673.54 rows=6534 width=102) (actual time=0.185..0.186 rows=1 loops=1)
+              Buffers: shared hit=8 read=5
+              ->  Nested Loop Left Join  (cost=0.71..45244.27 rows=6767 width=96) (actual time=0.172..0.172 rows=1 loops=1)
+                    Join Filter: (o.clinica_id = c.clinica_id)
+                    Filter: (COALESCE(o.en_proceso, '0'::bigint) < 1000)
+                    Buffers: shared hit=6 read=5
+                    ->  Nested Loop  (cost=0.71..43721.74 rows=20300 width=56) (actual time=0.070..0.070 rows=1 loops=1)
+                          Buffers: shared hit=3 read=4
+                          ->  Index Scan using mensajes_cola_listos on mensajes_entrantes m  (cost=0.29..23457.78 rows=20309 width=42) (actual time=0.035..0.035 rows=1 loops=1)
+                                Index Cond: (proximo_intento_en <= '2026-10-04 14:03:36.120885-05'::timestamp with time zone)
+                                Filter: (estado = ANY ('{pendiente,procesando}'::text[]))
+                                Buffers: shared hit=2 read=1
+                          ->  Index Scan using conversaciones_pkey on conversaciones c  (cost=0.42..1.00 rows=1 width=22) (actual time=0.033..0.033 rows=1 loops=1)
+                                Index Cond: (id = m.conversacion_id)
+                                Filter: ((procesando_hasta IS NULL) OR (procesando_hasta < '2026-10-04 14:03:36.120885-05'::timestamp with time zone))
+                                Buffers: shared hit=1 read=3
+                    ->  CTE Scan on ocupadas o  (cost=0.00..0.06 rows=3 width=56) (actual time=0.100..0.100 rows=1 loops=1)
+                          Buffers: shared hit=3 read=1
+              ->  Index Scan using mensajes_cola on mensajes_entrantes anterior  (cost=0.29..2.87 rows=1 width=22) (actual time=0.012..0.012 rows=0 loops=1)
+                    Index Cond: ((conversacion_id = m.conversacion_id) AND (secuencia < m.secuencia))
+                    Filter: (estado = ANY ('{pendiente,procesando}'::text[]))
+                    Buffers: shared hit=2
+Planning:
+  Buffers: shared hit=460 read=7
+Planning Time: 1.542 ms
+Execution Time: 0.294 ms
+
+== reclamo_50_listos ==
+Limit  (cost=164.33..174.86 rows=1 width=102) (actual time=0.232..0.234 rows=1 loops=1)
+  Buffers: shared hit=9 read=5 written=5
+  CTE ocupadas
+    ->  GroupAggregate  (cost=0.14..163.34 rows=3 width=16) (actual time=0.095..0.095 rows=1 loops=1)
+          Group Key: conversaciones.clinica_id
+          Buffers: shared hit=2 read=2 written=2
+          ->  Index Only Scan using conversaciones_en_proceso on conversaciones  (cost=0.14..162.87 rows=87 width=8) (actual time=0.030..0.077 rows=142 loops=1)
+                Index Cond: (procesando_hasta >= '2026-10-04 14:03:37.280413-05'::timestamp with time zone)
+                Heap Fetches: 142
+                Buffers: shared hit=2 read=2 written=2
+  ->  LockRows  (cost=0.99..68698.39 rows=6528 width=102) (actual time=0.231..0.232 rows=1 loops=1)
+        Buffers: shared hit=9 read=5 written=5
+        ->  Nested Loop Anti Join  (cost=0.99..68633.11 rows=6528 width=102) (actual time=0.221..0.221 rows=1 loops=1)
+              Buffers: shared hit=8 read=5 written=5
+              ->  Nested Loop Left Join  (cost=0.71..49063.39 rows=6753 width=96) (actual time=0.195..0.195 rows=1 loops=1)
+                    Join Filter: (o.clinica_id = c.clinica_id)
+                    Filter: (COALESCE(o.en_proceso, '0'::bigint) < 1000)
+                    Buffers: shared hit=6 read=5 written=5
+                    ->  Nested Loop  (cost=0.71..47543.86 rows=20260 width=56) (actual time=0.076..0.077 rows=1 loops=1)
+                          Buffers: shared hit=4 read=3 written=3
+                          ->  Index Scan using mensajes_cola_listos on mensajes_entrantes m  (cost=0.29..27297.50 rows=20269 width=42) (actual time=0.023..0.023 rows=1 loops=1)
+                                Index Cond: (proximo_intento_en <= '2026-10-04 14:03:37.280413-05'::timestamp with time zone)
+                                Filter: (estado = ANY ('{pendiente,procesando}'::text[]))
+                                Buffers: shared hit=3
+                          ->  Index Scan using conversaciones_pkey on conversaciones c  (cost=0.42..1.00 rows=1 width=22) (actual time=0.051..0.051 rows=1 loops=1)
+                                Index Cond: (id = m.conversacion_id)
+                                Filter: ((procesando_hasta IS NULL) OR (procesando_hasta < '2026-10-04 14:03:37.280413-05'::timestamp with time zone))
+                                Buffers: shared hit=1 read=3 written=3
+                    ->  CTE Scan on ocupadas o  (cost=0.00..0.06 rows=3 width=56) (actual time=0.116..0.116 rows=1 loops=1)
+                          Buffers: shared hit=2 read=2 written=2
+              ->  Index Scan using mensajes_cola on mensajes_entrantes anterior  (cost=0.29..2.90 rows=1 width=22) (actual time=0.024..0.024 rows=0 loops=1)
+                    Index Cond: ((conversacion_id = m.conversacion_id) AND (secuencia < m.secuencia))
+                    Filter: (estado = ANY ('{pendiente,procesando}'::text[]))
+                    Buffers: shared hit=2
+Planning:
+  Buffers: shared hit=449 read=12 written=5
+Planning Time: 4.832 ms
+Execution Time: 0.395 ms
+
+== referencia_secuencia_50_listos ==
+Limit  (cost=164.33..170.93 rows=1 width=94) (actual time=2.340..2.342 rows=1 loops=1)
+  Buffers: shared hit=162 read=29
+  CTE ocupadas
+    ->  GroupAggregate  (cost=0.14..163.34 rows=3 width=16) (actual time=0.057..0.057 rows=1 loops=1)
+          Group Key: conversaciones.clinica_id
+          Buffers: shared hit=4
+          ->  Index Only Scan using conversaciones_en_proceso on conversaciones  (cost=0.14..162.87 rows=87 width=8) (actual time=0.019..0.041 rows=142 loops=1)
+                Index Cond: (procesando_hasta >= '2026-10-04 14:03:37.68809-05'::timestamp with time zone)
+                Heap Fetches: 142
+                Buffers: shared hit=4
+  ->  LockRows  (cost=0.99..41449.41 rows=6281 width=94) (actual time=2.339..2.340 rows=1 loops=1)
+        Buffers: shared hit=162 read=29
+        ->  Nested Loop Anti Join  (cost=0.99..41386.60 rows=6281 width=94) (actual time=2.331..2.332 rows=1 loops=1)
+              Buffers: shared hit=161 read=29
+              ->  Nested Loop Left Join  (cost=0.71..22334.74 rows=6490 width=88) (actual time=2.312..2.313 rows=1 loops=1)
+                    Join Filter: (o.clinica_id = c.clinica_id)
+                    Filter: (COALESCE(o.en_proceso, '0'::bigint) < 1000)
+                    Buffers: shared hit=159 read=29
+                    ->  Nested Loop  (cost=0.71..20874.53 rows=19469 width=48) (actual time=2.229..2.229 rows=1 loops=1)
+                          Buffers: shared hit=155 read=29
+                          ->  Index Scan using ref_por_secuencia on mensajes_entrantes m  (cost=0.29..976.65 rows=19477 width=34) (actual time=2.205..2.205 rows=1 loops=1)
+                                Filter: ((estado = ANY ('{pendiente,procesando}'::text[])) AND (proximo_intento_en <= '2026-10-04 14:03:37.68809-05'::timestamp with time zone))
+                                Rows Removed by Filter: 10163
+                                Buffers: shared hit=151 read=29
+                          ->  Index Scan using conversaciones_pkey on conversaciones c  (cost=0.42..1.02 rows=1 width=22) (actual time=0.019..0.019 rows=1 loops=1)
+                                Index Cond: (id = m.conversacion_id)
+                                Filter: ((procesando_hasta IS NULL) OR (procesando_hasta < '2026-10-04 14:03:37.68809-05'::timestamp with time zone))
+                                Buffers: shared hit=4
+                    ->  CTE Scan on ocupadas o  (cost=0.00..0.06 rows=3 width=56) (actual time=0.081..0.081 rows=1 loops=1)
+                          Buffers: shared hit=4
+              ->  Index Scan using mensajes_cola on mensajes_entrantes anterior  (cost=0.29..2.94 rows=1 width=22) (actual time=0.016..0.016 rows=0 loops=1)
+                    Index Cond: ((conversacion_id = m.conversacion_id) AND (secuencia < m.secuencia))
+                    Filter: (estado = ANY ('{pendiente,procesando}'::text[]))
+                    Buffers: shared hit=2
+Planning:
+  Buffers: shared hit=464
+Planning Time: 2.316 ms
+Execution Time: 2.490 ms
+
+== reclamo_10_listos ==
+Limit  (cost=164.33..174.70 rows=1 width=102) (actual time=0.166..0.168 rows=1 loops=1)
+  Buffers: shared hit=12 read=2
+  CTE ocupadas
+    ->  GroupAggregate  (cost=0.14..163.34 rows=3 width=16) (actual time=0.054..0.054 rows=1 loops=1)
+          Group Key: conversaciones.clinica_id
+          Buffers: shared hit=4
+          ->  Index Only Scan using conversaciones_en_proceso on conversaciones  (cost=0.14..162.87 rows=87 width=8) (actual time=0.018..0.040 rows=142 loops=1)
+                Index Cond: (procesando_hasta >= '2026-10-04 14:03:40.330816-05'::timestamp with time zone)
+                Heap Fetches: 142
+                Buffers: shared hit=4
+  ->  LockRows  (cost=0.99..64073.11 rows=6178 width=102) (actual time=0.165..0.166 rows=1 loops=1)
+        Buffers: shared hit=12 read=2
+        ->  Nested Loop Anti Join  (cost=0.99..64011.33 rows=6178 width=102) (actual time=0.151..0.152 rows=1 loops=1)
+              Buffers: shared hit=11 read=2
+              ->  Nested Loop Left Join  (cost=0.71..45144.60 rows=6382 width=96) (actual time=0.131..0.132 rows=1 loops=1)
+                    Join Filter: (o.clinica_id = c.clinica_id)
+                    Filter: (COALESCE(o.en_proceso, '0'::bigint) < 1000)
+                    Buffers: shared hit=9 read=2
+                    ->  Nested Loop  (cost=0.71..43708.62 rows=19146 width=56) (actual time=0.058..0.058 rows=1 loops=1)
+                          Buffers: shared hit=5 read=2
+                          ->  Index Scan using mensajes_cola_listos on mensajes_entrantes m  (cost=0.29..23952.86 rows=19154 width=42) (actual time=0.019..0.019 rows=1 loops=1)
+                                Index Cond: (proximo_intento_en <= '2026-10-04 14:03:40.330816-05'::timestamp with time zone)
+                                Filter: (estado = ANY ('{pendiente,procesando}'::text[]))
+                                Buffers: shared hit=3
+                          ->  Index Scan using conversaciones_pkey on conversaciones c  (cost=0.42..1.03 rows=1 width=22) (actual time=0.037..0.037 rows=1 loops=1)
+                                Index Cond: (id = m.conversacion_id)
+                                Filter: ((procesando_hasta IS NULL) OR (procesando_hasta < '2026-10-04 14:03:40.330816-05'::timestamp with time zone))
+                                Buffers: shared hit=2 read=2
+                    ->  CTE Scan on ocupadas o  (cost=0.00..0.06 rows=3 width=56) (actual time=0.071..0.071 rows=1 loops=1)
+                          Buffers: shared hit=4
+              ->  Index Scan using mensajes_cola on mensajes_entrantes anterior  (cost=0.29..2.96 rows=1 width=22) (actual time=0.019..0.019 rows=0 loops=1)
+                    Index Cond: ((conversacion_id = m.conversacion_id) AND (secuencia < m.secuencia))
+                    Filter: (estado = ANY ('{pendiente,procesando}'::text[]))
+                    Buffers: shared hit=2
+Planning:
+  Buffers: shared hit=461 read=1
+Planning Time: 1.494 ms
+Execution Time: 0.264 ms
+
+== referencia_secuencia_10_listos ==
+Limit  (cost=164.33..171.01 rows=1 width=94) (actual time=6.839..6.843 rows=1 loops=1)
+  Buffers: shared hit=282 read=51
+  CTE ocupadas
+    ->  GroupAggregate  (cost=0.14..163.34 rows=3 width=16) (actual time=0.199..0.199 rows=1 loops=1)
+          Group Key: conversaciones.clinica_id
+          Buffers: shared hit=4
+          ->  Index Only Scan using conversaciones_en_proceso on conversaciones  (cost=0.14..162.87 rows=87 width=8) (actual time=0.038..0.150 rows=142 loops=1)
+                Index Cond: (procesando_hasta >= '2026-10-04 14:03:41.322455-05'::timestamp with time zone)
+                Heap Fetches: 142
+                Buffers: shared hit=4
+  ->  LockRows  (cost=0.99..40926.91 rows=6126 width=94) (actual time=6.838..6.840 rows=1 loops=1)
+        Buffers: shared hit=282 read=51
+        ->  Nested Loop Anti Join  (cost=0.99..40865.65 rows=6126 width=94) (actual time=6.818..6.819 rows=1 loops=1)
+              Buffers: shared hit=281 read=51
+              ->  Nested Loop Left Join  (cost=0.71..22099.75 rows=6332 width=88) (actual time=6.785..6.787 rows=1 loops=1)
+                    Join Filter: (o.clinica_id = c.clinica_id)
+                    Filter: (COALESCE(o.en_proceso, '0'::bigint) < 1000)
+                    Buffers: shared hit=279 read=51
+                    ->  Nested Loop  (cost=0.71..20675.02 rows=18996 width=48) (actual time=6.525..6.526 rows=1 loops=1)
+                          Buffers: shared hit=275 read=51
+                          ->  Index Scan using ref_por_secuencia on mensajes_entrantes m  (cost=0.29..985.26 rows=19004 width=34) (actual time=6.472..6.472 rows=1 loops=1)
+                                Filter: ((estado = ANY ('{pendiente,procesando}'::text[])) AND (proximo_intento_en <= '2026-10-04 14:03:41.322455-05'::timestamp with time zone))
+                                Rows Removed by Filter: 18293
+                                Buffers: shared hit=271 read=51
+                          ->  Index Scan using conversaciones_pkey on conversaciones c  (cost=0.42..1.04 rows=1 width=22) (actual time=0.045..0.046 rows=1 loops=1)
+                                Index Cond: (id = m.conversacion_id)
+                                Filter: ((procesando_hasta IS NULL) OR (procesando_hasta < '2026-10-04 14:03:41.322455-05'::timestamp with time zone))
+                                Buffers: shared hit=4
+                    ->  CTE Scan on ocupadas o  (cost=0.00..0.06 rows=3 width=56) (actual time=0.250..0.251 rows=1 loops=1)
+                          Buffers: shared hit=4
+              ->  Index Scan using mensajes_cola on mensajes_entrantes anterior  (cost=0.29..2.96 rows=1 width=22) (actual time=0.028..0.028 rows=0 loops=1)
+                    Index Cond: ((conversacion_id = m.conversacion_id) AND (secuencia < m.secuencia))
+                    Filter: (estado = ANY ('{pendiente,procesando}'::text[]))
+                    Buffers: shared hit=2
+Planning:
+  Buffers: shared hit=462
+Planning Time: 3.428 ms
+Execution Time: 7.009 ms
+
+== reclamo_listos_bloqueados ==
+Limit  (cost=164.33..173.56 rows=1 width=102) (actual time=37.344..37.348 rows=0 loops=1)
+  Buffers: shared hit=70178 read=56 dirtied=6
+  CTE ocupadas
+    ->  GroupAggregate  (cost=0.14..163.34 rows=3 width=16) (actual time=0.062..0.063 rows=1 loops=1)
+          Group Key: conversaciones.clinica_id
+          Buffers: shared hit=4
+          ->  Index Only Scan using conversaciones_en_proceso on conversaciones  (cost=0.14..162.87 rows=87 width=8) (actual time=0.025..0.049 rows=142 loops=1)
+                Index Cond: (procesando_hasta >= '2026-10-04 14:03:42.352935-05'::timestamp with time zone)
+                Heap Fetches: 142
+                Buffers: shared hit=4
+  ->  LockRows  (cost=0.99..85792.47 rows=9303 width=102) (actual time=37.343..37.345 rows=0 loops=1)
+        Buffers: shared hit=70178 read=56 dirtied=6
+        ->  Nested Loop Anti Join  (cost=0.99..85699.44 rows=9303 width=102) (actual time=37.342..37.343 rows=0 loops=1)
+              Buffers: shared hit=70178 read=56 dirtied=6
+              ->  Nested Loop Left Join  (cost=0.71..60790.21 rows=9785 width=96) (actual time=0.131..24.117 rows=10000 loops=1)
+                    Join Filter: (o.clinica_id = c.clinica_id)
+                    Filter: (COALESCE(o.en_proceso, '0'::bigint) < 1000)
+                    Buffers: shared hit=40178 read=56 dirtied=6
+                    ->  Nested Loop  (cost=0.71..58588.63 rows=29354 width=56) (actual time=0.050..18.871 rows=10000 loops=1)
+                          Buffers: shared hit=40174 read=56 dirtied=6
+                          ->  Index Scan using mensajes_cola_listos on mensajes_entrantes m  (cost=0.29..34339.15 rows=29367 width=42) (actual time=0.020..3.363 rows=10000 loops=1)
+                                Index Cond: (proximo_intento_en <= '2026-10-04 14:03:42.352935-05'::timestamp with time zone)
+                                Filter: (estado = ANY ('{pendiente,procesando}'::text[]))
+                                Buffers: shared hit=230 dirtied=6
+                          ->  Index Scan using conversaciones_pkey on conversaciones c  (cost=0.42..0.83 rows=1 width=22) (actual time=0.001..0.001 rows=1 loops=10000)
+                                Index Cond: (id = m.conversacion_id)
+                                Filter: ((procesando_hasta IS NULL) OR (procesando_hasta < '2026-10-04 14:03:42.352935-05'::timestamp with time zone))
+                                Buffers: shared hit=39944 read=56
+                    ->  CTE Scan on ocupadas o  (cost=0.00..0.06 rows=3 width=56) (actual time=0.000..0.000 rows=1 loops=10000)
+                          Buffers: shared hit=4
+              ->  Index Scan using mensajes_cola on mensajes_entrantes anterior  (cost=0.29..2.55 rows=1 width=22) (actual time=0.001..0.001 rows=1 loops=10000)
+                    Index Cond: ((conversacion_id = m.conversacion_id) AND (secuencia < m.secuencia))
+                    Filter: (estado = ANY ('{pendiente,procesando}'::text[]))
+                    Buffers: shared hit=30000
+Planning:
+  Buffers: shared hit=467
+Planning Time: 1.502 ms
+Execution Time: 37.448 ms

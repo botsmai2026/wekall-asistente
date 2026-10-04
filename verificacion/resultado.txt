@@ -1,0 +1,177 @@
+Esquema:   /home/claude/wekall-asistente/verificacion/../sql/001_esquema.sql
+           sha256 0bd230e59b6e9cb5d1297bbae27ad95329806798dd9f979f1443a296b255af18
+Consultas: /home/claude/wekall-asistente/verificacion/../sql/consultas.sql
+           sha256 1a31ec7e4d4ee9fb45a1d7d81da1ca379695e6b21f990e3eeb13e4381671d270  (40 sentencias con nombre)
+Ingestión: /home/claude/wekall-asistente/verificacion/../sql/ingestion.sql
+           sha256 584484e779affc60d16aa14de98a2d65bc7b9a4d1522a340cd8636799ea2a8cb  (5 sentencias con nombre)
+
+Esquema aplicado (pgvector presente)
+
+
+1. Restricciones del esquema
+  OK    teléfono con formato inválido
+  OK    teléfono repetido en la misma clínica
+  OK    escalada sin motivo
+  OK    motivo sin estar escalada
+  OK    estado de conversación desconocido
+  OK    message_id repetido
+  OK    texto de más de 2.000 caracteres
+  OK    procesado sin respuesta
+  OK    procesado sin intento válido
+  OK    pendiente con respuesta
+  OK    intento válido distinto del actual
+  OK    procesando sin haber sido reclamado
+  OK    tipo de respuesta desconocido
+  OK    cita con mensaje inexistente
+  OK    horario duplicado del mismo profesional
+  OK    horario que termina antes de empezar
+  OK    traza con intento 0
+  OK    traza de más de 64 KB
+  OK    bajar el estado de cita_agendada a resuelta_por_ia
+  OK    sacar una conversación de escalada
+
+2. Cola: orden por conversación
+  OK    se reclama el mensaje más antiguo  [('a.1', 4, 1)]
+  OK    el segundo mensaje espera mientras el primero se procesa  [None]
+  OK    al cerrar el primero, se reclama el segundo  [('a.2', 4, 1)]
+  OK    si el más antiguo espera reintento, el posterior no se adelanta
+  OK    cumplida la espera, se reclama el más antiguo  [('b.1', 5, 1)]
+  OK    mensaje huérfano se reclama al vencer el candado, con intento 2  [('b.1', 5, 2)]
+
+3. Protección contra el worker tardío
+  OK    worker tardío (intento 1) no puede crear cita
+  OK    worker tardío (intento 1) no puede cerrar
+  OK    el intento tardío deja traza marcada como descartada
+  OK    el cierre tardío no cambió el mensaje ni liberó el candado
+  OK    worker vigente (intento 2) crea la cita
+
+4. Citas: idempotencia y conflicto
+  OK    reintento sobre el MISMO horario de la cita propia se reconoce como propia
+  OK    reintento sobre OTRO horario devuelve la cita propia, no crea otra
+  OK    el mensaje tiene exactamente una cita
+  OK    la conversación pasó a cita_agendada en la misma transacción
+  OK    un cierre con estado de menor rango no baja el estado
+  OK    otro paciente sobre el horario ya tomado recibe 'ocupado'  [('c.1', 6, 1)]
+  OK    un horario cancelado se puede volver a reservar
+  OK    un horario pasado no se puede agendar  [('d.1', 7, 1)]
+  OK    cita con el mensaje de una conversación y el id de otra
+  OK    ingestión: las líneas quedan numeradas 1..N por su posición
+  OK    ingestión: con la misma huella no se reingiere
+  OK    fragmento en una clínica distinta de la de su documento
+  OK    fragmento que apunta a una línea que no existe
+  OK    línea de documento de más de 500 caracteres
+  OK    editar el texto de una línea ya ingerida
+  OK    la respuesta se arma con las líneas canónicas, en orden y sin repetir aunque se pidan desordenadas y duplicadas  [['## Horarios', 'Sede Sur: lunes a viernes, de 7:00 a. m. a 5:00 p. m.']]
+  OK    cambiar el título de un documento ya ingerido
+  OK    cambiar la huella de un documento
+  OK    modificar un fragmento
+  OK    borrar una línea suelta de un documento
+  OK    el intento de borrar una línea no destruyó el fragmento
+  OK    la búsqueda filtrada por otro modelo de embeddings no devuelve fragmentos
+  OK    comprobación de arranque: no hay fragmentos de un modelo distinto del configurado
+  OK    profesional con sede de una clínica y especialidad de otra
+  OK    horario con la clínica cambiada respecto a su profesional
+  OK    cita forzada: conversación de una clínica en un horario de otra
+  OK    cita forzada con la clínica del horario y la conversación de otra
+  OK    agendar_cita con un horario de otra clínica: 'horario_invalido', no 'pasado'  [('x.1', 9, 1)]
+  OK    agendar_cita con un horario inexistente: 'horario_invalido'
+  OK    disponibilidad: con la clínica A y una especialidad de la clínica B no devuelve nada
+  OK    disponibilidad: la clínica B sí ve su propio horario
+  OK    estado del conocimiento distingue listo, desactualizado y sin indexar  [['listo', 'desactualizado', 'sin_indexar']]
+  OK    estado del conocimiento: una clínica indexada a medias es 'parcial', no 'listo'  [parcial]
+  OK    tras reingerir el documento pendiente, la clínica vuelve a 'listo'
+  OK    comprobación de arranque: totales y actuales por clínica
+  OK    armar una respuesta con líneas de otra clínica: vacío
+  OK    la inserción de la cita no crea nada si el horario ya no es futuro
+  OK    no quedó ninguna cita cruzada entre clínicas
+  OK    reingerir: al borrar el documento desaparecen juntas sus líneas y fragmentos
+  OK    modificar texto de un mensaje
+  OK    modificar conversacion_id de un mensaje
+  OK    modificar enviado_en de un mensaje
+  OK    modificar recibido_en de un mensaje
+  OK    modificar message_id de un mensaje
+  OK    cambiar la respuesta de un mensaje ya terminado
+  OK    devolver a la cola un mensaje ya terminado
+  OK    respuesta de más de 4.096 caracteres
+  OK    horario solapado con otro del mismo profesional
+  OK    el orden lo define la llegada al servidor, no la hora que declara el mensaje  [('o.1', 11, 1)]
+  OK    worker tardío no puede escalar la conversación
+  OK    la conversación sigue sin escalar tras el intento tardío
+  OK    el worker vigente escala: estado, motivo y respuesta quedan en el mismo cierre
+  OK    el reclamo no puede revivir un mensaje ya terminado
+  OK    fallo de infraestructura: el intento vigente devuelve el mensaje a la cola  [('f.1', 12, 1)]
+  OK    tras el fallo: pendiente, conserva su número de intento y el candado queda libre
+  OK    mientras espera el reintento, ni él ni el mensaje posterior se reclaman
+  OK    un fallo reportado por un intento que ya no es el vigente no aplica
+  OK    el detalle lista los mensajes en el orden en que llegaron
+  OK    el intento fallido dejó su traza con el error, y el que ya no era vigente quedó como descartado
+
+4b. Orden de bloqueos: worker tardío agendando mientras otro reclama
+  OK    15 carreras reclamo/agendar: ningún deadlock; el tardío queda con intento vencido  [{('confirmó', 'intento_vencido')}]
+
+5. Concurrencia real
+  OK    20 pacientes simultáneos sobre un horario: exactamente una cita  [creada=1 ocupado=19]
+  OK    8 workers: los 180 mensajes se procesan exactamente una vez  [180 reclamos]
+  OK    8 workers: nunca dos a la vez en la misma conversación  [0 violaciones]
+  OK    8 workers: cada conversación en su orden
+  OK    equidad: con tope de 2 por clínica, tras dos de la clínica atrasada se atiende a la otra  [['equidad.a.0', 'equidad.a.1', 'equidad.b.0', None]]
+  OK    equidad: al terminar una conversación, la clínica atrasada recupera su turno  [('equidad.a.2', 110, 1)]
+  OK    presupuesto por clínica: 20 reclamos simultáneos, tope 2, quedan exactamente 2 por clínica  [en proceso [2, 2], admisiones rechazadas por carrera 24]
+  OK    aislamiento: un reclamo en REPEATABLE READ se rechaza y no toma nada
+  OK    aislamiento: las conexiones del verificador declaran READ COMMITTED de forma explícita
+  OK    presupuesto por clínica con rotación: 20 workers vacían 80 mensajes de 2 clínicas sin pasar nunca de 2 por clínica  [80 mensajes, máximo visto por los workers 2, máximo visto en la base 2]
+  OK    bandeja sin filtro: devuelve conversaciones de la clínica, la más reciente primero
+  OK    detalle de conversación: con la clínica correcta se lee; con otra clínica, vacío
+  OK    contexto de la clínica: zona horaria, y solo sus propias sedes y especialidades  [America/Bogota, 2 sedes, ['dermatologia']]
+  OK    contexto para el modelo: los últimos N turnos, entregados en orden cronológico
+
+6. Webhook: duplicados y límite por teléfono
+  OK    los primeros 20 mensajes del minuto se aceptan
+  OK    el mensaje 21 y el 22 reciben 429
+  OK    un duplicado con el teléfono en su límite recibe 202, no 429
+  OK    los mensajes rechazados por límite no quedaron guardados
+  OK    mismo message_id con otro texto: 409, no se acepta como duplicado
+  OK    mismo message_id desde otro teléfono: 409
+  OK    el mensaje original no cambió
+
+7. Outbox
+  OK    dos relevos simultáneos toman trazas distintas  [('a.1', 1) / ('a.2', 1)]
+  OK    si el relevo muere, la traza queda disponible de nuevo
+  OK    tras 10 rechazos pasa a requiere_revision y no bloquea a las demás  [('b.1', 1)]
+  OK    si el relevo se cuelga esperando a Mongo, Postgres corta su transacción y libera la traza  [cortada=True tomada=('b.1', 1) disponible=('b.1', 1)]
+  OK    el detalle puede leer del outbox la traza que no llegó a Mongo, con su estado  [[('a.1', 1, 'requiere_revision')]]
+
+7b. Búsqueda vectorial (solo con pgvector instalado)
+  OK    búsqueda vectorial: el fragmento más cercano es el que habla del tema  [[(4, 0.458), (5, 0.109), (3, 0.0)]]
+  OK    búsqueda vectorial: resultados ordenados de mayor a menor similitud
+  OK    búsqueda vectorial: la similitud queda entre 0 y 1
+  OK    búsqueda vectorial: nunca devuelve fragmentos de otra clínica
+  OK    búsqueda vectorial: la otra clínica solo ve su propio documento
+  OK    búsqueda vectorial: con otro modelo de embeddings configurado no devuelve nada
+  OK    búsqueda vectorial: una pregunta ajena obtiene similitud baja (aplicar el umbral es tarea de la aplicación; aquí no se prueba)  [ajena=[0.0, 0.0, 0.0] pertinente=0.458]
+  OK    búsqueda con texto: el mejor fragmento llega con sus líneas literales, en orden, y con el título y la huella de su documento
+  OK    búsqueda con texto: mismos fragmentos y mismo orden que la búsqueda sola, y nada de otra clínica
+  Fragmentos para la medición: 10004 (50 clínicas x 200)
+
+8. Planes de ejecución con volumen
+  Volumen: 200152 conversaciones, 1000620 mensajes, 326 sin terminar
+  OK    reclamo del worker: 0.27 ms
+  OK    límite por teléfono: 0.05 ms
+  OK    bandeja por estado: 0.09 ms
+  OK    contexto: últimos 10 turnos: 0.10 ms
+  OK    disponibilidad por especialidad, sede y fecha: 1.35 ms
+  OK    búsqueda vectorial exacta: 200 fragmentos de una clínica entre 10.000: 3.94 ms
+  OK    siguiente traza del outbox: 0.08 ms
+  OK    ¿existe cita de este mensaje?: 0.22 ms
+  OK    reclamo con 20.000 atrasados, todos listos: 0.29 ms
+  OK    reclamo con 50% de la cola esperando reintento: 0.40 ms
+  OK    referencia: mismo escenario con índice solo por secuencia (descartado): 2.49 ms
+  OK    reclamo con 90% de la cola esperando reintento: 0.26 ms
+  OK    referencia: mismo escenario con índice solo por secuencia (descartado): 7.01 ms
+  OK    reclamo con 10.000 mensajes listos pero bloqueados por el más antiguo de su conversación: 37.45 ms
+
+Sentencias de consultas.sql ejecutadas: 40 de 40
+Sentencias de ingestion.sql ejecutadas: 5 de 5
+Sin ejecutar: ninguna
+
+Resultado: 140 de 140 comprobaciones correctas

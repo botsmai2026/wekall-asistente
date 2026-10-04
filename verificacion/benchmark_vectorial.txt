@@ -1,0 +1,19 @@
+Búsqueda exacta, filtrada por clínica y modelo (sentencia real de consultas.sql)
+  fragmentos en la clínica |   p50 ms |   p95 ms
+                       200 |      2.3 |      3.7
+                      1000 |      8.9 |     13.2
+                      5000 |     41.2 |     55.7
+                     10000 |     71.9 |     73.7
+                     25000 |    243.5 |    288.6
+
+Referencia: índice HNSW (coseno) solo sobre la clínica de 25.000 fragmentos
+  Alcance de esta referencia:
+  - Es un índice parcial de una clínica. Para que el planificador lo use, la consulta nombra la
+    clínica como constante: NO es la sentencia parametrizada que ejecuta la aplicación.
+  - Muestra que un índice aproximado es mucho más rápido y que NO devuelve lo mismo que la búsqueda exacta.
+  - Los vectores son aleatorios, el peor caso para un índice aproximado: la coincidencia medida aquí
+    no es una estimación de lo que se obtendría con embeddings reales.
+  construir el índice de esa clínica: 53 s
+  el planificador usa el índice HNSW para esta consulta
+  p50 6.0 ms | p95 9.9 ms
+  resultados devueltos: 80 de 80 pedidos; coinciden con la búsqueda exacta: 28 de 80
