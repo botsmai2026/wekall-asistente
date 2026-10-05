@@ -33,3 +33,10 @@ export function estadoQuePide(tipo: TipoRespuesta): EstadoConversacion | null {
       return null;
   }
 }
+
+/**
+ * Respuestas que no cambian de tema: si llegan después de una oferta de horarios,
+ * la oferta sigue esperando la elección del paciente. Cualquier otro tipo la anula.
+ * La misma lista está en `agendar_validar_oferta` (sql/consultas.sql), que es la que decide al reservar.
+ */
+export const RESPUESTAS_QUE_CONSERVAN_LA_OFERTA: readonly TipoRespuesta[] = ['respuesta_documental', 'sin_informacion'];

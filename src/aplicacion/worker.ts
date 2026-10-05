@@ -12,7 +12,7 @@
 // este worker se demoró más que su candado, otro worker pudo tomar el mensaje;
 // el tardío no debe pisar su resultado. El número de intento es esa protección.
 import { ErrorDeProgramacion, ErrorLogico } from '../dominio/errores.js';
-import { estadoQuePide, type EstadoConversacion } from '../dominio/estados.js';
+import { estadoQuePide, RESPUESTAS_QUE_CONSERVAN_LA_OFERTA, type EstadoConversacion } from '../dominio/estados.js';
 import * as plantillas from '../dominio/plantillas.js';
 import { revertir } from '../infraestructura/postgres.js';
 import { IntentoVencido, Plazo, type ContextoIntento, type Dependencias, type ResultadoTurno } from './intento.js';
@@ -141,8 +141,18 @@ async function decidir(reclamo: Reclamo, plazo: Plazo, traza: Traza, deps: Depen
     base.enTransaccion((tx) => tx.ejecutar('contexto_especialidades', { clinica_id: reclamo.clinicaId }), plazo.paraBase()),
     base.enTransaccion((tx) => tx.ejecutar('contexto_ultimos_turnos', { conversacion_id: reclamo.conversacionId, n: limites.turnosDeContexto }), plazo.paraBase()),
   ]);
+  // ¿El asistente está esperando que el paciente elija de una oferta? Se mira el
+  // último turno que cambió de tema (se saltan las respuestas documentales): si
+  // es una oferta, esa es; si es otra cosa (pidió la fecha, no había horarios,
+  // confirmó una cita…), no hay oferta vigente aunque exista una más atrás.
+  const ultimoQueDecide = [...historial].reverse().find((turno) => !RESPUESTAS_QUE_CONSERVAN_LA_OFERTA.includes(turno.respuesta_tipo));
+  const ultimaOferta = ultimoQueDecide?.oferta_slots ? ultimoQueDecide : undefined;
+  const ofertaAnterior: ContextoIntento['ofertaAnterior'] = ultimaOferta ? {
+    messageId: ultimaOferta.message_id, secuencia: String(ultimaOferta.secuencia),
+    slots: ultimaOferta.oferta_slots.map(Number), consumida: ultimaOferta.oferta_consumida,
+  } : null;
   const contexto: ContextoIntento = {
-    ...reclamo, nombreClinica: clinica!.nombre, zona, plazo,
+    ...reclamo, nombreClinica: clinica!.nombre, zona, plazo, ofertaAnterior,
     sedes: sedes as ContextoIntento['sedes'], especialidades: especialidades as ContextoIntento['especialidades'],
   };
   try {
@@ -168,7 +178,7 @@ async function cerrar(reclamo: Reclamo, turno: Turno, traza: Traza, plazo: Plazo
     await tx.ejecutar('bloquear_conversacion', { message_id: reclamo.messageId });
     const aplicado = await tx.ejecutar('cierre_mensaje', {
       message_id: reclamo.messageId, intento: reclamo.intento, estado_mensaje: turno.estadoMensaje,
-      respuesta_tipo: turno.tipo, respuesta_texto: turno.texto,
+      respuesta_tipo: turno.tipo, respuesta_texto: turno.texto, oferta_slots: turno.ofertaSlots ?? null,
     });
     let resultado: ResultadoProcesamiento = 'descartado_por_intento';
     if (aplicado.length > 0) {

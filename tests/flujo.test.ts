@@ -18,8 +18,21 @@ afterAll(() => base.cerrar());
 const buscar = (pregunta: string): Paso => ({ herramienta: 'buscar_conocimiento', argumentos: { pregunta } });
 const responder = (argumentos: object): Paso => ({ herramienta: 'responder', argumentos });
 const consultarManana: Paso = { herramienta: 'consultar_disponibilidad', argumentos: { especialidad: 'Medicina general', sede: 'Norte', fecha: { dias_desde_hoy: 1 } } };
-const agendar = (horario: string): Paso => ({ herramienta: 'agendar_cita', argumentos: { horario } });
+const agendar = (opcion: number): Paso => ({ herramienta: 'agendar_cita', argumentos: { opcion } });
 const confirmar = responder({ tipo: 'confirmacion_cita' });
+
+/** Una reserva de test necesita la misma autorización que una reserva real. */
+async function prepararOferta(messageId: string, telefono = TELEFONO) {
+  await e.enviar('medicina general mañana en la Norte', `${messageId}.oferta`, telefono);
+  await procesarUno(e.con(consultarManana, (mensajes) => responder({
+    tipo: 'oferta_horarios', horarios: ultimoResultado(mensajes).horarios.slice(0, 3).map((h: any) => h.etiqueta),
+  })));
+}
+async function prepararEleccion(messageId: string, telefono = TELEFONO, opcion = 1) {
+  await prepararOferta(messageId, telefono);
+  await e.enviar(String(opcion), messageId, telefono);
+}
+
 
 describe('preguntas informativas', () => {
   it('responde con líneas literales del documento, incluido el encabezado de la sección', async () => {
@@ -103,8 +116,8 @@ describe('agendamiento', () => {
     expect(oferta.respuesta_texto).toContain('1. martes 6 de octubre de 2026, 8:00 a. m., con Dra. Laura Mejía, sede Norte');
     expect((await conversacion()).estado).toBe('en_curso'); // ofrecer horarios no cambia el estado
 
-    await e.enviar('El de las 8', 'm2');
-    await procesarUno(e.con(consultarManana, agendar('H1'), confirmar));
+    await e.enviar('El primero', 'm2');
+    await procesarUno(e.con(consultarManana, agendar(1), confirmar));
     const confirmacion = await mensaje('m2');
     expect(confirmacion.respuesta_tipo).toBe('confirmacion_cita');
     expect(confirmacion.respuesta_texto).toBe('Su cita quedó agendada: Medicina general con Dra. Laura Mejía, el martes 6 de octubre de 2026 a las 8:00 a. m., en la sede Norte.');
@@ -114,23 +127,23 @@ describe('agendamiento', () => {
     expect((await conversacion()).estado).toBe('cita_agendada');
   });
 
-  it('rechaza una etiqueta de horario que no se entregó en este intento', async () => {
+  it('rechaza horario como vía de reserva', async () => {
     await e.enviar('agéndame el H7', 'm1');
-    await procesarUno(e.con(agendar('H7'), responder({ tipo: 'pregunta_aclaratoria', faltantes: ['especialidad', 'fecha'] })));
-    expect((await trazas('m1'))[0].llamadas[0].resultado.error).toBe('etiqueta_desconocida');
+    await procesarUno(e.con({ herramienta: 'agendar_cita', argumentos: { horario: 'H7' } }, responder({ tipo: 'pregunta_aclaratoria', faltantes: ['especialidad', 'fecha'] })));
+    expect((await trazas('m1'))[0].llamadas[0].resultado.error).toBe('argumentos_invalidos');
     expect(await citas()).toHaveLength(0);
   });
 
   it('dos agendamientos en un turno: una sola cita y un error explícito', async () => {
-    await e.enviar('dos citas', 'm1');
-    await procesarUno(e.con(consultarManana, agendar('H1'), agendar('H2'), confirmar));
+    await prepararEleccion('m1');
+    await procesarUno(e.con(consultarManana, agendar(1), agendar(2), confirmar));
     expect(await citas()).toHaveLength(1);
     expect((await trazas('m1'))[0].llamadas[2].resultado.error).toBe('maximo_un_agendamiento_por_mensaje');
   });
 
   it('después de agendar, el modelo no puede responder otra cosa que la confirmación', async () => {
-    await e.enviar('cita', 'm1');
-    await procesarUno(e.con(consultarManana, agendar('H1'), responder({ tipo: 'sin_informacion' }), confirmar));
+    await prepararEleccion('m1');
+    await procesarUno(e.con(consultarManana, agendar(1), responder({ tipo: 'sin_informacion' }), confirmar));
     expect((await mensaje('m1')).respuesta_tipo).toBe('confirmacion_cita');
   });
 
@@ -152,6 +165,18 @@ describe('agendamiento', () => {
     expect(llamadas[3].resultado.error).toBe('argumentos_invalidos'); // exactamente una forma de fecha, no dos
   });
 
+  it('el día de la semana se acepta con tilde: "miércoles" y "Sábado" consultan ese día', async () => {
+    await e.enviar('dermatología el miércoles o el sábado', 'm1'); // escrito el lunes 5 de octubre
+    await procesarUno(e.con(
+      { herramienta: 'consultar_disponibilidad', argumentos: { especialidad: 'Dermatología', fecha: { dia_semana: 'miércoles' } } },
+      { herramienta: 'consultar_disponibilidad', argumentos: { especialidad: 'Dermatología', fecha: { dia_semana: 'Sábado' } } },
+      (mensajes) => responder({ tipo: 'oferta_horarios', horarios: [ultimoResultado(mensajes).horarios[0].etiqueta] }),
+    ));
+    const llamadas = (await trazas('m1'))[0].llamadas;
+    expect(llamadas[0].resultado.fecha_consultada).toBe('miércoles 7 de octubre de 2026');
+    expect(llamadas[1].resultado.fecha_consultada).toBe('sábado 10 de octubre de 2026');
+  });
+
   it('una consulta sin horarios permite "sin_disponibilidad"; con horarios, no', async () => {
     await e.enviar('dermatología el domingo', 'm1');
     await procesarUno(e.con(
@@ -166,23 +191,45 @@ describe('agendamiento', () => {
   });
 
   it('dos pacientes piden el mismo horario a la vez: solo uno lo obtiene', async () => {
-    await e.enviar('cita', 'a1', '+573000000001');
-    await e.enviar('cita', 'b1', '+573000000002');
+    await prepararOferta('a1', '+573000000001');
+    await prepararOferta('b1', '+573000000002');
+    await e.enviar('1', 'a1', '+573000000001');
+    await e.enviar('1', 'b1', '+573000000002');
     const guion = (): Paso[] => [
       consultarManana,
-      agendar('H1'),
-      (mensajes) => (ultimoResultado(mensajes).error === 'ocupado' ? responder({ tipo: 'oferta_horarios', horarios: ['H2'] }) : confirmar),
+      agendar(1),
+      // Quien pierde la carrera debe volver a consultar antes de ofrecer: la disponibilidad cambió.
+      (mensajes) => (ultimoResultado(mensajes).error === 'ocupado' ? consultarManana : confirmar),
+      (mensajes) => responder({ tipo: 'oferta_horarios', horarios: [ultimoResultado(mensajes).horarios[0].etiqueta] }),
     ];
-    await Promise.all([procesarUno(e.con(...guion())), procesarUno(e.con(...guion()))]);
+    // Los dos ya recibieron el mismo slot. La barrera sincroniza los intentos
+    // de reserva para medir la carrera real, sin depender de etiquetas nuevas.
+    let consultaron = 0;
+    let abrir!: () => void;
+    const ambosConsultaron = new Promise<void>((resolver) => { abrir = resolver; });
+    const enCarrera = () => {
+      const deps = e.con(...guion());
+      const original = deps.modelo.completar.bind(deps.modelo);
+      let llamada = 0;
+      deps.modelo.completar = async (...argumentos) => {
+        if (++llamada === 2) { // la consulta ya se ejecutó: ahora el modelo va a pedir agendar
+          if (++consultaron === 2) abrir();
+          await ambosConsultaron;
+        }
+        return original(...argumentos);
+      };
+      return deps;
+    };
+    await Promise.all([procesarUno(enCarrera()), procesarUno(enCarrera())]);
     expect(await citas()).toHaveLength(1);
     const tipos = [(await mensaje('a1')).respuesta_tipo, (await mensaje('b1')).respuesta_tipo].sort();
     expect(tipos).toEqual(['confirmacion_cita', 'oferta_horarios']);
   });
 
   it('cita creada y caída antes del cierre: el reintento no llama al modelo y no duplica la cita', async () => {
-    await e.enviar('cita', 'm1');
+    await prepararEleccion('m1');
     // El intento 1 crea la cita y luego el modelo falla: el intento se aborta sin responder.
-    await procesarUno(e.con(consultarManana, agendar('H1'), { falla: new ErrorInfraestructura('modelo caído') }));
+    await procesarUno(e.con(consultarManana, agendar(1), { falla: new ErrorInfraestructura('modelo caído') }));
     expect(await citas()).toHaveLength(1);
     expect((await mensaje('m1')).estado).toBe('pendiente');
 
@@ -264,8 +311,8 @@ describe('cola, reintentos y escalamiento', () => {
   });
 
   it('el estado no baja: "cita_agendada" sobrevive a una pregunta posterior', async () => {
-    await e.enviar('cita', 'm1');
-    await procesarUno(e.con(consultarManana, agendar('H1'), confirmar));
+    await prepararEleccion('m1');
+    await procesarUno(e.con(consultarManana, agendar(1), confirmar));
     await e.enviar('¿Tienen parqueadero?', 'm2');
     await procesarUno(e.con(buscar('parqueadero sede Norte'), (mensajes) => responder({ tipo: 'respuesta_documental', lineas: [ultimoResultado(mensajes).fragmentos[0].lineas[0].etiqueta] })));
     expect((await mensaje('m2')).respuesta_tipo).toBe('respuesta_documental');
@@ -327,10 +374,10 @@ describe('lo que se le envía al modelo', () => {
 
 describe('plazo del intento', () => {
   it('si el plazo de 60 s se agota durante el ciclo, se escala sin ejecutar más herramientas', async () => {
-    await e.enviar('cita', 'm1');
+    await prepararEleccion('m1');
     const deps = e.con(consultarManana, () => {
       e.reloj.avanzar(61_000); // el modelo tardó demasiado
-      return agendar('H1');
+      return agendar(1);
     });
     await procesarUno(deps);
     expect(await citas()).toHaveLength(0); // no se agendó fuera de plazo
@@ -352,31 +399,31 @@ describe('plazo del intento', () => {
 
 describe('una cita creada siempre se le confirma al paciente', () => {
   it('después de agendar no se puede escalar: el modelo debe confirmar', async () => {
-    await e.enviar('cita', 'm1');
-    await procesarUno(e.con(consultarManana, agendar('H1'), { herramienta: 'escalar_a_humano', argumentos: { motivo: 'paciente_lo_pide' } }, confirmar));
+    await prepararEleccion('m1');
+    await procesarUno(e.con(consultarManana, agendar(1), { herramienta: 'escalar_a_humano', argumentos: { motivo: 'paciente_lo_pide' } }, confirmar));
     expect((await trazas('m1'))[0].llamadas[2].resultado.error).toBe('respuesta_no_permitida');
     expect((await mensaje('m1')).respuesta_tipo).toBe('confirmacion_cita');
     expect((await conversacion()).estado).toBe('cita_agendada');
   });
 
   it('si el plazo o las iteraciones se agotan después de agendar, el código confirma la cita en lugar de escalar', async () => {
-    await e.enviar('cita', 'm1');
-    await procesarUno(e.con(consultarManana, agendar('H1'), () => {
+    await prepararEleccion('m1');
+    await procesarUno(e.con(consultarManana, agendar(1), () => {
       e.reloj.avanzar(61_000);
       return responder({ tipo: 'sin_informacion' });
     }));
     expect((await mensaje('m1')).respuesta_tipo).toBe('confirmacion_cita');
 
-    await e.enviar('otra', 'm2', '+573000000009');
+    await prepararEleccion('m2', '+573000000009', 2);
     const sinFin = responder({ tipo: 'sin_informacion' });
-    await procesarUno(e.con(consultarManana, agendar('H2'), sinFin, sinFin, sinFin));
+    await procesarUno(e.con(consultarManana, agendar(2), sinFin, sinFin, sinFin));
     expect((await mensaje('m2')).respuesta_tipo).toBe('confirmacion_cita');
     expect(await citas()).toHaveLength(2);
   });
 
   it('un worker tardío no puede crear una cita', async () => {
-    await e.enviar('cita', 'm1');
-    const tardio = e.con(consultarManana, agendar('H1'), confirmar);
+    await prepararEleccion('m1');
+    const tardio = e.con(consultarManana, agendar(1), confirmar);
     tardio.limites = { ...tardio.limites, plazoIntentoMs: 600_000 }; // para que lo detenga el intento, no el plazo
     const original = tardio.modelo.completar.bind(tardio.modelo);
     let llamada = 0;
@@ -394,8 +441,8 @@ describe('una cita creada siempre se le confirma al paciente', () => {
   });
 
   it('si la cita de este mensaje ya existe al agendar, se reconoce como propia y no como "ocupado"', async () => {
-    await e.enviar('cita', 'm1');
-    const deps = e.con(consultarManana, agendar('H1'), confirmar);
+    await prepararEleccion('m1');
+    const deps = e.con(consultarManana, agendar(1), confirmar);
     const original = deps.modelo.completar.bind(deps.modelo);
     let llamada = 0;
     deps.modelo.completar = async (...argumentos) => {
@@ -414,11 +461,11 @@ describe('una cita creada siempre se le confirma al paciente', () => {
   });
 
   it('un horario cuya cita se canceló se puede volver a reservar', async () => {
-    await e.enviar('cita', 'a1', '+573000000001');
-    await procesarUno(e.con(consultarManana, agendar('H1'), confirmar));
+    await prepararEleccion('a1', '+573000000001');
+    await procesarUno(e.con(consultarManana, agendar(1), confirmar));
     await base.pool.query("UPDATE citas SET estado = 'cancelada'");
-    await e.enviar('cita', 'b1', '+573000000002');
-    await procesarUno(e.con(consultarManana, agendar('H1'), confirmar));
+    await prepararEleccion('b1', '+573000000002');
+    await procesarUno(e.con(consultarManana, agendar(1), confirmar));
     const todas = await citas();
     expect(todas.map((c) => c.estado)).toEqual(['cancelada', 'agendada']);
     expect(todas[0].slot_id).toBe(todas[1].slot_id);
@@ -463,13 +510,13 @@ describe('conocimiento y texto no confiable', () => {
 });
 
 describe('etiquetas de horario y reingestión', () => {
-  it('un horario ofrecido en un mensaje anterior no sirve en el siguiente: hay que volver a consultar', async () => {
+  it('una etiqueta anterior no autoriza; una posición válida conserva el slot pese a consultar de nuevo', async () => {
     await e.enviar('medicina general mañana', 'm1');
     await procesarUno(e.con(consultarManana, responder({ tipo: 'oferta_horarios', horarios: ['H1'] })));
-    await e.enviar('ese', 'm2');
-    await procesarUno(e.con(agendar('H1'), consultarManana, agendar('H1'), confirmar));
+    await e.enviar('1', 'm2');
+    await procesarUno(e.con({ herramienta: 'agendar_cita', argumentos: { horario: 'H1' } }, consultarManana, agendar(1), confirmar));
     const llamadas = (await trazas('m2'))[0].llamadas;
-    expect(llamadas[0].resultado.error).toBe('etiqueta_desconocida'); // la memoria de etiquetas es del intento
+    expect(llamadas[0].resultado.error).toBe('argumentos_invalidos'); // las etiquetas nunca autorizan reservas
     expect(llamadas[2].resultado.estado).toBe('cita_agendada');
   });
 
@@ -531,5 +578,678 @@ describe('"no tengo esa información" exige haber buscado', () => {
     });
     await procesarUno(deps);
     expect((await mensaje('m1')).respuesta_tipo).toBe('sin_informacion');
+  });
+});
+
+describe('el paciente elige de la lista que ya recibió', () => {
+  const ofrecerTres: Paso = (mensajes) => responder({ tipo: 'oferta_horarios', horarios: ultimoResultado(mensajes).horarios.slice(0, 3).map((h: any) => h.etiqueta) });
+  const elegir = (opcion: number): Paso => ({ herramienta: 'agendar_cita', argumentos: { opcion } });
+
+  it('"el primero" agenda el horario que el paciente vio, sin volver a consultar', async () => {
+    await e.enviar('medicina general mañana en la Norte', 'm1');
+    await procesarUno(e.con(consultarManana, ofrecerTres));
+    await e.enviar('el segundo', 'm2');
+    const deps = e.con(elegir(2), confirmar);
+    await procesarUno(deps);
+    expect(deps.modelo.llamadas).toBe(2);
+    expect((await mensaje('m2')).respuesta_texto).toContain('a las 8:30 a. m.');
+    const [cita] = await citas();
+    expect(cita.inicia_en).toEqual(new Date('2026-10-06T13:30:00Z'));
+  });
+
+  it('si otro paciente tomó ese horario entre los dos mensajes, NO se agenda el que ahora ocupa esa posición', async () => {
+    await e.enviar('medicina general mañana en la Norte', 'a1', '+573000000001');
+    await procesarUno(e.con(consultarManana, ofrecerTres)); // A ve: 1) 8:00  2) 8:30  3) 9:00
+
+    await prepararEleccion('b1', '+573000000002');
+    await procesarUno(e.con(consultarManana, agendar(1), confirmar)); // B toma las 8:00
+
+    await e.enviar('el primero', 'a2', '+573000000001');
+    await procesarUno(e.con(elegir(1), consultarManana, ofrecerTres));
+
+    const llamadas = (await trazas('a2'))[0].llamadas;
+    expect(llamadas[0].resultado.error).toBe('ocupado');
+    const respuesta = await mensaje('a2');
+    expect(respuesta.respuesta_tipo).toBe('oferta_horarios');
+    expect(respuesta.respuesta_texto.split('\n')[0]).toBe('El horario de las 8:00 a. m. del martes 6 de octubre de 2026 que eligió ya no está disponible.');
+    expect(respuesta.respuesta_texto).toContain('1. martes 6 de octubre de 2026, 8:30 a. m.');
+    // La única cita es la de B: A no quedó con las 8:30 sin haberlas elegido.
+    const todas = await citas();
+    expect(todas.map((c) => c.source_message_id)).toEqual(['b1']);
+
+    // La oferta nueva reemplaza a la anterior: ahora "el primero" de A es las 8:30.
+    await e.enviar('el primero', 'a3', '+573000000001');
+    await procesarUno(e.con(elegir(1), confirmar));
+    expect((await mensaje('a3')).respuesta_texto).toContain('a las 8:30 a. m.');
+  });
+
+  it('una pregunta entre la oferta y la elección no hace perder la oferta', async () => {
+    await e.enviar('medicina general mañana en la Norte', 'm1');
+    await procesarUno(e.con(consultarManana, ofrecerTres));
+    await e.enviar('¿tienen parqueadero?', 'm2');
+    await procesarUno(e.con(buscar('parqueadero sede Norte'), responder({ tipo: 'sin_informacion' })));
+    await e.enviar('la tercera', 'm3');
+    await procesarUno(e.con(elegir(3), confirmar));
+    expect((await mensaje('m3')).respuesta_texto).toContain('a las 9:00 a. m.');
+  });
+
+  it('sin una oferta previa, o con una opción que no existía, el error vuelve al modelo', async () => {
+    await e.enviar('el primero', 'm1');
+    await procesarUno(e.con(elegir(1), responder({ tipo: 'pregunta_aclaratoria', faltantes: ['especialidad', 'fecha'] })));
+    expect((await trazas('m1'))[0].llamadas[0].resultado.error).toBe('sin_oferta_previa');
+
+    await e.enviar('medicina general mañana en la Norte', 'm2');
+    await procesarUno(e.con(consultarManana, ofrecerTres));
+    await e.enviar('el quinto', 'm3');
+    await procesarUno(e.con(elegir(5), { herramienta: 'agendar_cita', argumentos: { opcion: 1, horario: 'H1' } }, responder({ tipo: 'pregunta_aclaratoria', faltantes: ['horario'] })));
+    const llamadas = (await trazas('m3'))[0].llamadas;
+    expect(llamadas[0].resultado.error).toBe('opcion_desconocida');
+    expect(llamadas[1].resultado.error).toBe('argumentos_invalidos'); // opción y etiqueta a la vez
+    expect(await citas()).toHaveLength(0);
+  });
+});
+
+describe('el paciente describe el horario en vez de dar su número', () => {
+  // Sin sede: la lista trae las 8:00 con dos profesionales, uno en cada sede.
+  const consultarDosSedes: Paso = { herramienta: 'consultar_disponibilidad', argumentos: { especialidad: 'Medicina general', fecha: { dias_desde_hoy: 1 } } };
+  const ofrecerCuatro: Paso = (mensajes) => responder({ tipo: 'oferta_horarios', horarios: ultimoResultado(mensajes).horarios.slice(0, 4).map((h: any) => h.etiqueta) });
+  const describir = (atributos: Record<string, string>): Paso => ({ herramienta: 'agendar_cita', argumentos: { atributos } });
+  const ofrecer = async () => {
+    await e.enviar('medicina general mañana', 'm1');
+    await procesarUno(e.con(consultarDosSedes, ofrecerCuatro)); // 8:00 Norte, 8:00 Sur, 8:30 Norte, 8:30 Sur
+  };
+
+  it('una oferta con dos opciones a la misma hora pide el número', async () => {
+    await ofrecer();
+    expect((await mensaje('m1')).respuesta_texto.split('\n').at(-1)).toBe('Indíqueme el número de la opción que prefiere y la agendo.');
+  });
+
+  it('"la de las 8" con dos horarios a las 8: no se agenda y se le pregunta cuál, sin volver al modelo', async () => {
+    await ofrecer();
+    await e.enviar('la de las 8', 'm2');
+    const deps = e.con(describir({ hora: '08:00' }));
+    await procesarUno(deps);
+    expect(deps.modelo.llamadas).toBe(1); // el turno termina en el código: el modelo no puede elegir por el paciente
+    expect(await citas()).toHaveLength(0);
+    const respuesta = await mensaje('m2');
+    expect(respuesta.respuesta_tipo).toBe('oferta_horarios');
+    const lineas = respuesta.respuesta_texto.split('\n');
+    expect(lineas[0]).toBe('Estos son los horarios que coinciden con la búsqueda:');
+    expect(lineas.slice(1, 3).map((l: string) => l.slice(0, 2)).sort()).toEqual(['1.', '2.']);
+    expect(lineas.slice(1, 3).every((l: string) => l.includes('8:00 a. m.'))).toBe(true);
+    const llamada = (await trazas('m2'))[0].llamadas[0];
+    expect(llamada.real.resultado).toBe('oferta_por_atributos');
+    expect(llamada.real.slots).toHaveLength(2);
+
+    // La lista sigue vigente con sus números: el paciente contesta y se agenda ese.
+    const elegida = lineas[2].includes('sede Sur') ? 'Sur' : 'Norte';
+    await e.enviar('la 2', 'm3');
+    await procesarUno(e.con({ herramienta: 'agendar_cita', argumentos: { opcion: 2 } }, confirmar));
+    expect((await mensaje('m3')).respuesta_texto).toContain(`a las 8:00 a. m., en la sede ${elegida}`);
+    expect(await citas()).toHaveLength(1);
+  });
+
+  it('una coincidencia única se ofrece y solo se agenda con otro mensaje posicional', async () => {
+    await ofrecer();
+    await e.enviar('la de las 8 en la Sur', 'm2');
+    await procesarUno(e.con(describir({ hora: '08:00', sede: 'Sur' })));
+    expect(await citas()).toHaveLength(0);
+    expect((await mensaje('m2')).oferta_slots).toHaveLength(1);
+    await e.enviar('1', 'm3');
+    await procesarUno(e.con(agendar(1), confirmar));
+    expect((await mensaje('m3')).respuesta_texto).toBe('Su cita quedó agendada: Medicina general con Dr. Andrés Caicedo, el martes 6 de octubre de 2026 a las 8:00 a. m., en la sede Sur.');
+  });
+
+  it('el profesional se reconoce sin tildes ni tratamiento, y por sí solo puede ser ambiguo', async () => {
+    await ofrecer();
+    await e.enviar('con la doctora mejia', 'm2');
+    await procesarUno(e.con(describir({ profesional: 'doctora mejia' }))); // 8:00 y 8:30 con ella
+    expect((await mensaje('m2')).respuesta_tipo).toBe('oferta_horarios');
+    await e.enviar('con mejia a las 8:30', 'm3');
+    await procesarUno(e.con(describir({ profesional: 'Mejia', hora: '08:30' })));
+    expect(await citas()).toHaveLength(0);
+    await e.enviar('la primera', 'm4');
+    await procesarUno(e.con(agendar(1), confirmar));
+    expect((await mensaje('m4')).respuesta_texto).toContain('con Dra. Laura Mejía, el martes 6 de octubre de 2026 a las 8:30 a. m.');
+  });
+
+  it('sin coincidencias, el error vuelve al modelo con la lista y no cierra el turno para agendar', async () => {
+    await ofrecer();
+    await e.enviar('la de las 3', 'm2');
+    await procesarUno(e.con(
+      describir({ hora: '03:00' }),
+      (mensajes) => {
+        const resultado = ultimoResultado(mensajes);
+        expect(resultado.error).toBe('sin_coincidencia');
+        expect(resultado.opciones).toHaveLength(4);
+        return responder({ tipo: 'pregunta_aclaratoria', faltantes: ['horario'] });
+      },
+    ));
+    expect(await citas()).toHaveLength(0);
+    expect((await mensaje('m2')).respuesta_tipo).toBe('oferta_horarios'); // pedir el horario con una oferta en espera es volver a mostrarla
+  });
+
+  it('se resuelve contra lo que el paciente vio: si su única coincidencia ya la tomó otro, no se agenda otra', async () => {
+    await e.enviar('medicina general mañana en la Norte', 'a1', '+573000000001');
+    await procesarUno(e.con(consultarManana, (mensajes) => responder({ tipo: 'oferta_horarios', horarios: ultimoResultado(mensajes).horarios.slice(0, 3).map((h: any) => h.etiqueta) })));
+    await prepararEleccion('b1', '+573000000002');
+    await procesarUno(e.con(consultarManana, agendar(1), confirmar));
+    await e.enviar('la de las 8', 'a2', '+573000000001');
+    await procesarUno(e.con(describir({ hora: '08:00' })));
+    expect((await mensaje('a2')).oferta_slots).toHaveLength(1);
+    await e.enviar('1', 'a3', '+573000000001');
+    await procesarUno(e.con(agendar(1), consultarManana, (mensajes) => responder({ tipo: 'oferta_horarios', horarios: [ultimoResultado(mensajes).horarios[0].etiqueta] })));
+    expect((await trazas('a3'))[0].llamadas[0].resultado.error).toBe('ocupado');
+    expect((await mensaje('a3')).respuesta_texto.split('\n')[0]).toContain('ya no está disponible');
+    expect((await citas()).map((c) => c.source_message_id)).toEqual(['b1']);
+  });
+
+  it('sin oferta previa, o con varios modos a la vez, es un error de argumentos', async () => {
+    await e.enviar('la de las 8', 'm1');
+    await procesarUno(e.con(
+      describir({ hora: '08:00' }),
+      { herramienta: 'agendar_cita', argumentos: { opcion: 1, atributos: { hora: '08:00' } } },
+      { herramienta: 'agendar_cita', argumentos: { atributos: {} } },
+      { herramienta: 'agendar_cita', argumentos: { atributos: { hora: '8' } } },
+      responder({ tipo: 'pregunta_aclaratoria', faltantes: ['especialidad', 'fecha'] }),
+    ));
+    expect((await trazas('m1'))[0].llamadas.slice(0, 4).map((l: any) => l.resultado.error)).toEqual(['sin_oferta_previa', 'argumentos_invalidos', 'argumentos_invalidos', 'argumentos_invalidos']);
+  });
+});
+
+describe('si la elección del paciente falla, ese mensaje ya no puede crear ninguna cita', () => {
+  const ofrecerTres: Paso = (mensajes) => responder({ tipo: 'oferta_horarios', horarios: ultimoResultado(mensajes).horarios.slice(0, 3).map((h: any) => h.etiqueta) });
+  const A = '+573000000001';
+  const B = '+573000000002';
+
+  // A ve 8:00, 8:30 y 9:00; B toma las 8:00; A responde "el primero".
+  async function carrera() {
+    await e.enviar('medicina general mañana en la Norte', 'a1', A);
+    await procesarUno(e.con(consultarManana, ofrecerTres));
+    await prepararEleccion('b1', B);
+    await procesarUno(e.con(consultarManana, agendar(1), confirmar));
+    await e.enviar('el primero', 'a2', A);
+  }
+  const soloLaDeB = async () => expect((await citas()).map((c) => c.source_message_id)).toEqual(['b1']);
+
+  it('un modelo que insiste con otra opción, o con una etiqueta de una consulta nueva, no consigue agendar', async () => {
+    await carrera();
+    await procesarUno(e.con(
+      { herramienta: 'agendar_cita', argumentos: { opcion: 1 } }, // ocupado
+      { herramienta: 'agendar_cita', argumentos: { opcion: 2 } }, // intenta la siguiente de la lista vieja
+      consultarManana,
+      { herramienta: 'agendar_cita', argumentos: { horario: 'H1' } }, // vía eliminada
+      responder({ tipo: 'oferta_horarios', horarios: ['H1', 'H2', 'H3'] }),
+    ));
+    const llamadas = (await trazas('a2'))[0].llamadas;
+    expect(llamadas.map((l: any) => l.resultado.error)).toEqual(['ocupado', 'nueva_eleccion_requerida', undefined, 'argumentos_invalidos', undefined]);
+    expect((await mensaje('a2')).respuesta_tipo).toBe('oferta_horarios');
+    await soloLaDeB();
+  });
+
+  it('la selección autorizada también queda bloqueada si pierde el slot antes de insertar', async () => {
+    await prepararEleccion('a1', A);
+    const deps = e.con(consultarManana, agendar(1), agendar(2), consultarManana, ofrecerTres);
+    const original = deps.modelo.completar.bind(deps.modelo);
+    let llamada = 0;
+    deps.modelo.completar = async (...argumentos) => {
+      if (++llamada === 2) {
+        // A ya eligió de su oferta; antes de insertar, B toma ese mismo slot.
+        await prepararEleccion('b1', B);
+        await procesarUno(e.con(consultarManana, agendar(1), confirmar));
+      }
+      return original(...argumentos);
+    };
+    await procesarUno(deps);
+    const llamadas = (await trazas('a1'))[0].llamadas;
+    expect(llamadas[1].resultado.error).toBe('ocupado');
+    expect(llamadas[2].resultado.error).toBe('nueva_eleccion_requerida');
+    await soloLaDeB();
+  });
+
+  it('el paciente siempre se entera: no se acepta otra respuesta, ni una oferta sin volver a consultar', async () => {
+    await carrera();
+    await procesarUno(e.con(
+      { herramienta: 'agendar_cita', argumentos: { opcion: 1 } },
+      responder({ tipo: 'pregunta_aclaratoria', faltantes: ['horario'] }), // no le dice qué pasó
+      responder({ tipo: 'sin_disponibilidad' }), // sin haber consultado después del fallo
+      consultarManana,
+      ofrecerTres,
+    ));
+    const llamadas = (await trazas('a2'))[0].llamadas;
+    expect(llamadas[1].resultado.error).toBe('respuesta_no_permitida');
+    expect(llamadas[2].resultado.error).toBe('respuesta_no_permitida');
+    expect((await mensaje('a2')).respuesta_texto).toContain('que eligió ya no está disponible');
+  });
+
+  it('si además no quedan horarios, la respuesta dice qué pasó con el que eligió', async () => {
+    await carrera();
+    await procesarUno(e.con(
+      { herramienta: 'agendar_cita', argumentos: { opcion: 1 } },
+      { herramienta: 'consultar_disponibilidad', argumentos: { especialidad: 'Medicina general', sede: 'Norte', fecha: { dia_semana: 'domingo' } } },
+      responder({ tipo: 'sin_disponibilidad' }),
+    ));
+    expect((await mensaje('a2')).respuesta_texto).toBe(
+      'El horario de las 8:00 a. m. del martes 6 de octubre de 2026 que eligió ya no está disponible.\n' +
+      'No hay horarios disponibles de Medicina general para el domingo 11 de octubre de 2026 en la sede Norte. Si lo desea, puedo buscar en otra fecha.',
+    );
+    await soloLaDeB();
+  });
+
+  it('un error de argumentos del modelo NO cierra el turno: el modelo corrige y agenda en el mismo mensaje', async () => {
+    await e.enviar('medicina general mañana en la Norte', 'a1', A);
+    await procesarUno(e.con(consultarManana, ofrecerTres));
+    await e.enviar('el segundo', 'a2', A);
+    await procesarUno(e.con(
+      { herramienta: 'agendar_cita', argumentos: { opcion: 7 } }, // la lista tenía 3 opciones
+      { herramienta: 'agendar_cita', argumentos: { horario: 'H99' } }, // vía eliminada
+      { herramienta: 'agendar_cita', argumentos: { opcion: 2, horario: 'H1' } }, // dos formas a la vez
+      { herramienta: 'agendar_cita', argumentos: { opcion: 2 } }, // ahora sí
+      confirmar,
+    ));
+    const llamadas = (await trazas('a2'))[0].llamadas;
+    expect(llamadas.slice(0, 3).map((l: any) => l.resultado.error)).toEqual(['opcion_no_autorizada', 'argumentos_invalidos', 'argumentos_invalidos']);
+    expect(llamadas[3].resultado.estado).toBe('cita_agendada');
+    expect((await mensaje('a2')).respuesta_texto).toContain('a las 8:30 a. m.');
+  });
+
+  it('con la elección fallida, los caminos de salida siguen abiertos: escalar a un asesor, o agotar las iteraciones', async () => {
+    await carrera();
+    await procesarUno(e.con({ herramienta: 'agendar_cita', argumentos: { opcion: 1 } }, { herramienta: 'escalar_a_humano', argumentos: { motivo: 'paciente_lo_pide' } }));
+    expect((await mensaje('a2')).respuesta_tipo).toBe('escalamiento');
+    await soloLaDeB();
+    // La traza conserva qué horario había elegido el paciente: el asesor lo ve sin tener que preguntarlo.
+    expect((await trazas('a2'))[0].llamadas[0].real).toMatchObject({ resultado: 'ocupado', horario_elegido: '2026-10-06T13:00:00.000Z' });
+
+    // Otro paciente en la misma situación, con un modelo que nunca acierta la respuesta.
+    const C = '+573000000003';
+    await e.enviar('medicina general mañana en la Norte', 'c1', C);
+    await procesarUno(e.con(consultarManana, (mensajes) => responder({ tipo: 'oferta_horarios', horarios: [ultimoResultado(mensajes).horarios[0].etiqueta] }))); // C ve las 8:30
+    await base.pool.query("UPDATE slots SET inicia_en = inicia_en - interval '30 days', termina_en = termina_en - interval '30 days' WHERE id = (SELECT oferta_slots[1] FROM mensajes_entrantes WHERE message_id = 'c1')"); // ese horario deja de ser futuro
+    await e.enviar('1', 'c2', C);
+    const insiste = { herramienta: 'agendar_cita', argumentos: { opcion: 1 } };
+    await procesarUno(e.con(insiste, insiste, insiste, insiste, insiste));
+    const llamadas = (await trazas('c2'))[0].llamadas;
+    expect(llamadas.map((l: any) => l.resultado.error)).toEqual(['pasado', 'nueva_eleccion_requerida', 'nueva_eleccion_requerida', 'nueva_eleccion_requerida', 'nueva_eleccion_requerida']);
+    expect((await mensaje('c2')).respuesta_tipo).toBe('escalamiento');
+    expect((await base.pool.query("SELECT motivo_escalamiento FROM conversaciones WHERE telefono = $1", [C])).rows[0].motivo_escalamiento).toBe('iteraciones_agotadas');
+    await soloLaDeB();
+  });
+
+  it('en el mensaje siguiente el paciente sí puede elegir de la oferta nueva', async () => {
+    await carrera();
+    await procesarUno(e.con({ herramienta: 'agendar_cita', argumentos: { opcion: 1 } }, consultarManana, ofrecerTres));
+    await e.enviar('el primero', 'a3', A);
+    await procesarUno(e.con({ herramienta: 'agendar_cita', argumentos: { opcion: 1 } }, confirmar));
+    expect((await mensaje('a3')).respuesta_texto).toContain('a las 8:30 a. m.');
+  });
+});
+
+
+describe('solo el mensaje completo autoriza una selección posicional', () => {
+  it.each(['la de las 8', 'no agendes nada', 'no el primero', 'el primero o el segundo', 'el primero si hay lugar', 'agéndame mañana a las 8'])('no crea cita con %s aunque el modelo pase opcion', async (texto) => {
+    await prepararOferta('m2');
+    await e.enviar(texto, 'm2');
+    await procesarUno(e.con(agendar(1)));
+    expect(await citas()).toHaveLength(0);
+    // No se reserva: se vuelve a mostrar la lista, guardada como oferta nueva, y se pide el número.
+    expect((await mensaje('m2')).respuesta_tipo).toBe('oferta_horarios');
+    expect((await mensaje('m2')).respuesta_texto.split('\n')[0]).toBe('Para agendar necesito el número de la opción.');
+    expect((await trazas('m2'))[0].llamadas[0].real.resultado).toBe('seleccion_no_posicional');
+  });
+
+  it('rechaza una opción distinta y permite corregirla con la posición original', async () => {
+    await prepararOferta('m2');
+    const oferta = await mensaje('m2.oferta');
+    await e.enviar('La segunda.', 'm2');
+    await procesarUno(e.con(agendar(1), agendar(2), confirmar));
+    expect((await trazas('m2'))[0].llamadas[0].resultado.error).toBe('opcion_no_autorizada');
+    expect((await citas()).map((c) => c.slot_id)).toEqual([Number(oferta.oferta_slots[1])]);
+  });
+
+  it('consultar un H válido no autoriza una reserva sin oferta persistida', async () => {
+    await e.enviar('agéndame medicina general mañana a las 8', 'm1');
+    await procesarUno(e.con(consultarManana, { herramienta: 'agendar_cita', argumentos: { horario: 'H1' } }, responder({ tipo: 'oferta_horarios', horarios: ['H1', 'H2'] })));
+    expect((await trazas('m1'))[0].llamadas[1].resultado.error).toBe('argumentos_invalidos');
+    expect(await citas()).toHaveLength(0);
+  });
+
+  it('los atributos inventados solo ofrecen; la oferta reducida necesita otra elección', async () => {
+    const consultar = { herramienta: 'consultar_disponibilidad', argumentos: { especialidad: 'Medicina general', fecha: { dias_desde_hoy: 1 } } };
+    await e.enviar('medicina general mañana', 'm1');
+    await procesarUno(e.con(consultar, (mensajes) => responder({ tipo: 'oferta_horarios', horarios: ultimoResultado(mensajes).horarios.slice(0, 4).map((h: any) => h.etiqueta) })));
+    await e.enviar('la de las 8', 'm2');
+    await procesarUno(e.con({ herramienta: 'agendar_cita', argumentos: { atributos: { hora: '08:00', sede: 'Sur' } } }));
+    expect(await citas()).toHaveLength(0);
+    const reducida = await mensaje('m2');
+    expect(reducida.respuesta_tipo).toBe('oferta_horarios');
+    expect(reducida.oferta_slots).toHaveLength(1);
+    expect(reducida.respuesta_texto).toContain('1.');
+    await e.enviar('1', 'm3');
+    await procesarUno(e.con(agendar(1), confirmar));
+    expect((await citas()).map((c) => c.slot_id)).toEqual([Number(reducida.oferta_slots[0])]);
+  });
+});
+
+
+describe('ciclo de vida de ofertas persistidas', () => {
+  const ofrecerTres: Paso = (mensajes) => responder({ tipo: 'oferta_horarios', horarios: ultimoResultado(mensajes).horarios.slice(0, 3).map((h: any) => h.etiqueta) });
+
+  it.each(['2', 'el segundo', '3', 'el primero'])('una reserva consume toda O1: "%s" no crea otra cita', async (texto) => {
+    await prepararEleccion('reserva', TELEFONO, 2);
+    const original = (await mensaje('reserva.oferta')).oferta_slots;
+    await procesarUno(e.con(agendar(2), confirmar));
+    await e.enviar(texto, 'reutilizacion');
+    const posicion = texto === '3' ? 3 : texto === 'el primero' ? 1 : 2;
+    await procesarUno(e.con(agendar(posicion), consultarManana, ofrecerTres));
+    expect(await citas()).toHaveLength(1);
+    expect((await trazas('reutilizacion'))[0].llamadas[0].resultado.error).toBe('sin_oferta_previa');
+    expect((await mensaje('reserva.oferta')).oferta_slots).toEqual(original);
+    expect((await mensaje('reutilizacion')).respuesta_tipo).toBe('oferta_horarios');
+  });
+
+  it.each(['opcion', 'atributos'])('cancelar la cita no revive O1 para %s', async (modo) => {
+    await prepararEleccion('reserva', TELEFONO, 2);
+    await procesarUno(e.con(agendar(2), confirmar));
+    await base.pool.query("UPDATE citas SET estado = 'cancelada'");
+    await e.enviar(modo === 'opcion' ? '3' : 'la de las 8', 'atributos');
+    await procesarUno(e.con(modo === 'opcion' ? agendar(3) : { herramienta: 'agendar_cita', argumentos: { atributos: { hora: '08:00' } } }, consultarManana, ofrecerTres));
+    expect(await citas()).toHaveLength(1);
+    expect((await trazas('atributos'))[0].llamadas[0].resultado.error).toBe('sin_oferta_previa');
+  });
+
+  it('O2 posterior y otra selección permiten dos citas activas del mismo paciente', async () => {
+    await prepararEleccion('primera', TELEFONO, 2);
+    await procesarUno(e.con(agendar(2), confirmar));
+    await prepararEleccion('segunda', TELEFONO, 3);
+    const o2 = await mensaje('segunda.oferta');
+    await procesarUno(e.con(agendar(3), confirmar));
+    const todas = await citas();
+    expect(todas).toHaveLength(2);
+    expect(todas.every((c) => c.estado === 'agendada')).toBe(true);
+    expect(todas[1].slot_id).toBe(Number(o2.oferta_slots[2]));
+  });
+
+  it('O2 consumida no hace retroceder a O1', async () => {
+    await prepararOferta('o1');
+    await prepararEleccion('reserva', TELEFONO, 2);
+    await procesarUno(e.con(agendar(2), confirmar));
+    await e.enviar('1', 'reutilizacion');
+    await procesarUno(e.con(agendar(1), consultarManana, ofrecerTres));
+    expect(await citas()).toHaveLength(1);
+    expect((await trazas('reutilizacion'))[0].llamadas[0].resultado.error).toBe('sin_oferta_previa');
+  });
+
+  it('el consumo existe antes del cierre y el reintento recupera sin LLM', async () => {
+    await prepararEleccion('reserva', TELEFONO, 2);
+    await procesarUno(e.con(agendar(2), { falla: new ErrorInfraestructura('caída después de reservar') }));
+    const c = await conversacion();
+    const historial = await base.enTransaccion((tx) => tx.ejecutar('contexto_ultimos_turnos', { conversacion_id: c.id, n: 10 }));
+    expect(historial.find((m) => m.message_id === 'reserva.oferta')?.oferta_consumida).toBe(true);
+    expect((await mensaje('reserva')).estado).toBe('pendiente');
+    e.reloj.avanzar(6_000);
+    const recuperacion = e.con();
+    await procesarUno(recuperacion);
+    expect(recuperacion.modelo.llamadas).toBe(0);
+    expect((await mensaje('reserva')).respuesta_tipo).toBe('confirmacion_cita');
+    await e.enviar('3', 'posterior');
+    await procesarUno(e.con(agendar(3), consultarManana, ofrecerTres));
+    expect(await citas()).toHaveLength(1);
+  });
+
+  async function autorizacion(mid: string, opcion = 1) {
+    const o = await mensaje('o1.oferta');
+    const m = await mensaje(mid);
+    return { message_id: mid, conversacion_id: m.conversacion_id, oferta_message_id: o.message_id,
+      oferta_secuencia: o.secuencia, oferta_slots: o.oferta_slots, opcion, slot_id: o.oferta_slots[opcion - 1], ahora: e.reloj.ahora() };
+  }
+
+  it('dos transacciones concurrentes con O1 y slots distintos: solo una la consume', async () => {
+    await prepararOferta('o1');
+    await e.enviar('1', 'a');
+    await e.enviar('2', 'b');
+    const permisos = await Promise.all([autorizacion('a', 1), autorizacion('b', 2)]);
+    const resultados = await Promise.all(permisos.map((permiso) => base.enTransaccion(async (tx) => {
+      await tx.ejecutar('bloquear_conversacion', { message_id: permiso.message_id });
+      return tx.ejecutar('agendar_insertar_cita', permiso);
+    })));
+    expect(resultados.map((r) => r.length).sort()).toEqual([0, 1]);
+    expect(await citas()).toHaveLength(1);
+  });
+
+  it.each(['oferta_message_id', 'oferta_secuencia', 'oferta_slots', 'opcion', 'slot_id', 'conversacion_id'])('el INSERT rechaza una autorización con %s cambiado', async (campo) => {
+    await prepararOferta('o1');
+    await e.enviar('1', 'a');
+    const permiso: Record<string, unknown> = await autorizacion('a');
+    const valores: Record<string, unknown> = { oferta_message_id: 'inexistente', oferta_secuencia: '0',
+      oferta_slots: [...(permiso.oferta_slots as string[])].reverse(), opcion: 2,
+      slot_id: (permiso.oferta_slots as string[])[1], conversacion_id: 999999 };
+    permiso[campo] = valores[campo];
+    const insertadas = await base.enTransaccion(async (tx) => {
+      await tx.ejecutar('bloquear_conversacion', { message_id: 'a' });
+      return tx.ejecutar('agendar_insertar_cita', permiso);
+    });
+    expect(insertadas).toHaveLength(0);
+    expect(await citas()).toHaveLength(0);
+  });
+
+  it.each(['opcion', 'atributos'])('una cita de otro mensaje consume O1 durante el LLM: bloquea %s', async (modo) => {
+    await prepararOferta('o1');
+    await e.enviar(modo === 'opcion' ? '1' : 'la de las 8', 'a');
+    await e.enviar('2', 'b');
+    const deps = e.con(modo === 'opcion' ? agendar(1) : { herramienta: 'agendar_cita', argumentos: { atributos: { hora: '08:00' } } }, consultarManana, ofrecerTres);
+    const completar = deps.modelo.completar.bind(deps.modelo);
+    let primera = true;
+    deps.modelo.completar = async (...args) => {
+      if (primera) {
+        primera = false;
+        const permiso = await autorizacion('b', 2);
+        await base.enTransaccion(async (tx) => {
+          await tx.ejecutar('bloquear_conversacion', { message_id: 'b' });
+          expect(await tx.ejecutar('agendar_insertar_cita', permiso)).toHaveLength(1);
+        });
+      }
+      return completar(...args);
+    };
+    await procesarUno(deps);
+    expect(await citas()).toHaveLength(1);
+    expect((await trazas('a'))[0].llamadas[0].resultado.error).toBe('oferta_no_vigente');
+  });
+
+  it('una oferta posterior entre lectura y reserva invalida la identidad O1', async () => {
+    await prepararOferta('o1');
+    await e.enviar('1', 'a');
+    const deps = e.con(agendar(1), consultarManana, ofrecerTres);
+    const completar = deps.modelo.completar.bind(deps.modelo);
+    let primera = true;
+    deps.modelo.completar = async (...args) => {
+      if (primera) {
+        primera = false;
+        // Simula un cambio de oferta mientras el modelo conserva O1. El worker
+        // normal serializa mensajes; el INSERT también debe rechazar esta foto.
+        const o = await mensaje('o1.oferta');
+        await base.pool.query(`INSERT INTO mensajes_entrantes
+          (message_id, conversacion_id, texto, enviado_en, estado, intento_actual, intento_valido, respuesta_tipo, respuesta_texto, oferta_slots)
+          VALUES ('o2', $1, 'nueva oferta', $2, 'procesado', 1, 1, 'oferta_horarios', 'otra lista', $3)`,
+          [o.conversacion_id, e.reloj.ahora(), [...o.oferta_slots].reverse()]);
+      }
+      return completar(...args);
+    };
+    await procesarUno(deps);
+    expect(await citas()).toHaveLength(0);
+    expect((await trazas('a'))[0].llamadas[0].resultado.error).toBe('oferta_no_vigente');
+    // También la sentencia final sola protege la identidad, aunque se omita la clasificación.
+    const permiso = await autorizacion('a');
+    expect(await base.enTransaccion((tx) => tx.ejecutar('agendar_insertar_cita', permiso))).toHaveLength(0);
+  });
+});
+
+describe('una posición solo vale si el asistente está esperando la elección de esa oferta', () => {
+  const ofrecer = (n: number): Paso => (mensajes) => responder({ tipo: 'oferta_horarios', horarios: ultimoResultado(mensajes).horarios.slice(0, n).map((h: any) => h.etiqueta) });
+  const pedir = (...faltantes: string[]) => responder({ tipo: 'pregunta_aclaratoria', faltantes });
+  const ofertaInicial = async (n = 6) => {
+    await e.enviar('medicina general mañana en la Norte', 'm1');
+    await procesarUno(e.con(consultarManana, ofrecer(n)));
+    return (await mensaje('m1')).oferta_slots.map(Number);
+  };
+  // Un modelo que insiste: intenta reservar, y al ser rechazado consulta y ofrece.
+  const intentarReservar = async (texto: string, messageId: string, opcion: number) => {
+    await e.enviar(texto, messageId);
+    await procesarUno(e.con(agendar(opcion), consultarManana, ofrecer(3)));
+    return (await trazas(messageId))[0].llamadas[0].resultado.error;
+  };
+
+  it('oferta → "el segundo": reserva', async () => {
+    const slots = await ofertaInicial();
+    await e.enviar('el segundo', 'm2');
+    await procesarUno(e.con(agendar(2), confirmar));
+    expect((await citas()).map((c) => c.slot_id)).toEqual([slots[1]]);
+  });
+
+  it('oferta → pregunta documental → "opción 2": la oferta sigue esperando y reserva', async () => {
+    const slots = await ofertaInicial();
+    await e.enviar('¿Cuánto ayuno necesito para el perfil lipídico?', 'm2');
+    await procesarUno(e.con(buscar('ayuno perfil lipídico'), (mensajes) => responder({ tipo: 'respuesta_documental', lineas: [ultimoResultado(mensajes).fragmentos[0].lineas[0].etiqueta] })));
+    expect((await mensaje('m2')).respuesta_tipo).toBe('respuesta_documental');
+    await e.enviar('¿tienen parqueadero?', 'm3');
+    await procesarUno(e.con(buscar('parqueadero sede Norte'), responder({ tipo: 'sin_informacion' })));
+    await e.enviar('opción 2', 'm4');
+    await procesarUno(e.con(agendar(2), confirmar));
+    expect((await citas()).map((c) => c.slot_id)).toEqual([slots[1]]);
+  });
+
+  it('oferta → "mejor otro día" → el asistente pide la fecha → "el 5": no reserva la opción 5', async () => {
+    await ofertaInicial(6);
+    await e.enviar('mejor otro día', 'm2');
+    await procesarUno(e.con(pedir('fecha')));
+    expect(await intentarReservar('el 5', 'm3', 5)).toBe('sin_oferta_previa');
+    expect(await citas()).toHaveLength(0);
+  });
+
+  it.each([
+    ['sede', '2'], ['especialidad', 'la primera'], ['fecha', 'el primero'], ['intencion', 'opción 3'],
+  ])('oferta → el asistente pide %s → "%s": la oferta vieja no se reutiliza, ni por posición ni por atributos', async (faltante, texto) => {
+    await ofertaInicial(6);
+    await e.enviar('espere', 'm2');
+    await procesarUno(e.con(pedir(faltante)));
+    await e.enviar('la de las 8', 'm3');
+    await procesarUno(e.con({ herramienta: 'agendar_cita', argumentos: { atributos: { hora: '08:00' } } }, pedir('fecha')));
+    expect((await trazas('m3'))[0].llamadas[0].resultado.error).toBe('sin_oferta_previa');
+    const posicion = texto === '2' ? 2 : texto === 'opción 3' ? 3 : 1;
+    expect(await intentarReservar(texto, 'm4', posicion)).toBe('sin_oferta_previa');
+    expect(await citas()).toHaveLength(0);
+  });
+
+  it('oferta → no hay horarios en otra fecha → una posición no reutiliza la oferta vieja', async () => {
+    await ofertaInicial(6);
+    await e.enviar('¿y el domingo?', 'm2');
+    await procesarUno(e.con({ herramienta: 'consultar_disponibilidad', argumentos: { especialidad: 'Medicina general', sede: 'Norte', fecha: { dia_semana: 'domingo' } } }, responder({ tipo: 'sin_disponibilidad' })));
+    expect((await mensaje('m2')).respuesta_tipo).toBe('sin_disponibilidad');
+    expect(await intentarReservar('1', 'm3', 1)).toBe('sin_oferta_previa');
+    expect(await citas()).toHaveLength(0);
+  });
+
+  it('una oferta posterior reactiva la selección, y solo contra la oferta nueva', async () => {
+    const vieja = await ofertaInicial(6);
+    await e.enviar('mejor otro día', 'm2');
+    await procesarUno(e.con(pedir('fecha')));
+    await e.enviar('pasado mañana', 'm3');
+    await procesarUno(e.con({ herramienta: 'consultar_disponibilidad', argumentos: { especialidad: 'Medicina general', sede: 'Norte', fecha: { dias_desde_hoy: 2 } } }, ofrecer(3)));
+    const nueva = (await mensaje('m3')).oferta_slots.map(Number);
+    expect(nueva.some((slot: number) => vieja.includes(slot))).toBe(false);
+    await e.enviar('el 3', 'm4');
+    await procesarUno(e.con(agendar(3), confirmar));
+    expect((await citas()).map((c) => c.slot_id)).toEqual([nueva[2]]);
+  });
+
+  it('la validación final también lo exige: con la identidad exacta de la oferta, el INSERT no crea la cita', async () => {
+    const slots = await ofertaInicial(6);
+    const oferta = await mensaje('m1');
+    await e.enviar('mejor otro día', 'm2');
+    await procesarUno(e.con(pedir('fecha')));
+    await e.enviar('el 5', 'm3');
+    const filas = await base.enTransaccion((tx) => tx.ejecutar('agendar_insertar_cita', {
+      conversacion_id: Number(oferta.conversacion_id), message_id: 'm3', slot_id: slots[4],
+      oferta_message_id: 'm1', oferta_secuencia: String(oferta.secuencia), oferta_slots: slots, opcion: 5, ahora: e.reloj.ahora(),
+    }));
+    expect(filas).toHaveLength(0);
+    expect(await citas()).toHaveLength(0);
+  });
+});
+
+describe('cuando el paciente no da un número, se vuelve a ofrecer con la disponibilidad de ahora', () => {
+  const ofrecerTres: Paso = (mensajes) => responder({ tipo: 'oferta_horarios', horarios: ultimoResultado(mensajes).horarios.slice(0, 3).map((h: any) => h.etiqueta) });
+  const A = '+573000000001';
+  const B = '+573000000002';
+
+  it('"ese": no reserva; la lista nueva se guarda como oferta y el número siguiente se resuelve contra ella', async () => {
+    await e.enviar('medicina general mañana en la Norte', 'a1', A);
+    await procesarUno(e.con(consultarManana, ofrecerTres));
+    const original = (await mensaje('a1')).oferta_slots.map(Number);
+    await e.enviar('ese', 'a2', A);
+    const deps = e.con(agendar(1));
+    await procesarUno(deps);
+    expect(deps.modelo.llamadas).toBe(1); // el turno termina en el código
+    const reoferta = await mensaje('a2');
+    expect(reoferta.respuesta_tipo).toBe('oferta_horarios');
+    expect(reoferta.oferta_slots.map(Number)).toEqual(original);
+    expect(await citas()).toHaveLength(0);
+    await e.enviar('2', 'a3', A);
+    await procesarUno(e.con(agendar(2), confirmar));
+    expect((await citas()).map((c) => c.slot_id)).toEqual([original[1]]);
+  });
+
+  it('si entre la oferta y la reoferta otro paciente tomó un horario, la lista nueva no lo presenta', async () => {
+    await e.enviar('medicina general mañana en la Norte', 'a1', A);
+    await procesarUno(e.con(consultarManana, ofrecerTres)); // A ve: 1) 8:00  2) 8:30  3) 9:00
+    const original = (await mensaje('a1')).oferta_slots.map(Number);
+
+    await e.enviar('medicina general mañana en la Norte', 'b0', B);
+    await procesarUno(e.con(consultarManana, ofrecerTres));
+    await e.enviar('1', 'b1', B);
+    await procesarUno(e.con(agendar(1), confirmar)); // B toma las 8:00
+
+    await e.enviar('el último', 'a2', A);
+    await procesarUno(e.con(agendar(3)));
+    const reoferta = await mensaje('a2');
+    expect(reoferta.respuesta_tipo).toBe('oferta_horarios');
+    expect(reoferta.oferta_slots.map(Number)).toEqual([original[1], original[2]]);
+    expect(reoferta.respuesta_texto).not.toContain('8:00 a. m.');
+    expect(reoferta.respuesta_texto).toContain('1. martes 6 de octubre de 2026, 8:30 a. m.');
+    expect((await trazas('a2'))[0].llamadas[0].real.retirados).toEqual([original[0]]);
+
+    // "1" ahora es las 8:30: se resuelve contra la lista que A acaba de leer, no contra la primera.
+    await e.enviar('1', 'a3', A);
+    await procesarUno(e.con(agendar(1), confirmar));
+    expect((await mensaje('a3')).respuesta_texto).toContain('a las 8:30 a. m.');
+    expect((await citas()).map((c) => c.source_message_id)).toEqual(['b1', 'a3']);
+  });
+
+  it('si ya no queda libre ninguno de los horarios ofrecidos, el modelo debe consultar de nuevo', async () => {
+    await e.enviar('medicina general mañana en la Norte', 'a1', A);
+    await procesarUno(e.con(consultarManana, (mensajes) => responder({ tipo: 'oferta_horarios', horarios: [ultimoResultado(mensajes).horarios[0].etiqueta] })));
+    await e.enviar('medicina general mañana en la Norte', 'b0', B);
+    await procesarUno(e.con(consultarManana, ofrecerTres));
+    await e.enviar('1', 'b1', B);
+    await procesarUno(e.con(agendar(1), confirmar));
+    await e.enviar('ese', 'a2', A);
+    await procesarUno(e.con(agendar(1), consultarManana, ofrecerTres));
+    expect((await trazas('a2'))[0].llamadas[0].resultado.error).toBe('oferta_no_vigente');
+    expect((await mensaje('a2')).respuesta_texto).toContain('1. martes 6 de octubre de 2026, 8:30 a. m.');
+    expect((await citas()).map((c) => c.source_message_id)).toEqual(['b1']);
+  });
+
+  it('pedir solo el horario con una oferta en espera la vuelve a mostrar; sin oferta, es una pregunta', async () => {
+    await e.enviar('quiero una cita', 'm0');
+    await procesarUno(e.con(responder({ tipo: 'pregunta_aclaratoria', faltantes: ['horario'] })));
+    expect((await mensaje('m0')).respuesta_tipo).toBe('pregunta_aclaratoria');
+    await e.enviar('medicina general mañana en la Norte', 'm1');
+    await procesarUno(e.con(consultarManana, ofrecerTres));
+    await e.enviar('cualquiera', 'm2');
+    await procesarUno(e.con(responder({ tipo: 'pregunta_aclaratoria', faltantes: ['horario'] })));
+    expect((await mensaje('m2')).respuesta_tipo).toBe('oferta_horarios');
+    await e.enviar('la 3', 'm3');
+    await procesarUno(e.con(agendar(3), confirmar));
+    expect(await citas()).toHaveLength(1);
   });
 });

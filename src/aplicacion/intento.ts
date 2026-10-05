@@ -51,6 +51,8 @@ export interface ContextoIntento {
   zona: string;
   sedes: { id: number; nombre: string }[];
   especialidades: { id: number; nombre: string }[];
+  /** La oferta que espera la elección del paciente: identidad y contenido. Null si el asistente ya cambió de tema; nunca se busca una anterior. */
+  ofertaAnterior: { messageId: string; secuencia: string; slots: number[]; consumida: boolean } | null;
   plazo: Plazo;
 }
 
@@ -79,6 +81,13 @@ export class MemoriaIntento {
   busquedas = 0;
   ultimaConsulta: { especialidad: string; sede: string | null; fecha: FechaLocal; vacia: boolean } | null = null;
   citaCreada: CitaParaMostrar | null = null;
+  /**
+   * El paciente eligió un horario y no se pudo agendar (ocupado, pasado o inválido).
+   * Desde ese momento este intento NO puede crear ninguna cita: el mensaje del
+   * paciente autorizaba ese horario y ningún otro. Solo queda consultar de nuevo
+   * y contarle qué pasó; la nueva elección llega en otro mensaje.
+   */
+  eleccionFallida: { slotId: number; hora: Date | null; consultoDespues: boolean } | null = null;
 }
 
 /** Cómo termina un turno: qué recibe el paciente y qué pasa con la conversación. */
@@ -87,6 +96,8 @@ export interface ResultadoTurno {
   texto: string;
   /** Solo si el turno escala la conversación. */
   motivoEscalamiento?: string;
+  /** Solo en una oferta de horarios: los horarios ofrecidos, en el orden mostrado. Se guardan con la respuesta. */
+  ofertaSlots?: number[];
 }
 
 /** El intento ya no es el vigente: otro worker tomó el mensaje. Hay que detenerse sin tocar nada. */

@@ -5,11 +5,12 @@ Uso:
     python3 verificar.py [--dsn "host=localhost port=5432 user=postgres password=..."]
                          [--esquema 001_esquema.sql] [--consultas consultas.sql] [--ingestion ingestion.sql]
 
-Crea una base temporal llamada "verificacion", aplica el esquema indicado y
-prueba restricciones, concurrencia y planes de ejecución.
+Crea una base temporal llamada "verificacion", aplica el esquema indicado y las
+migraciones que lo acompañan (002_..., en orden), y prueba restricciones,
+concurrencia y planes de ejecución.
 
-Qué archivos verifica: los que se le indiquen (por defecto, los que están junto
-a este script). Al empezar imprime la ruta y la huella SHA-256 de cada uno, y
+Qué archivos verifica: los que se le indiquen (por defecto, los de la carpeta
+sql/). Al empezar imprime la ruta y la huella SHA-256 de cada uno, y
 las deja en resultado.txt, para que no haya duda de qué versión se probó.
 
 Las sentencias de la aplicación NO están copiadas aquí: se cargan de
@@ -82,7 +83,8 @@ def Q(nombre):
 def P(**parametros):
     """Parámetros de una consulta. 'ahora' es el reloj de la aplicación."""
     parametros.setdefault("ahora", datetime.now(timezone.utc))
-    parametros.setdefault("max_por_clinica", 1000)        # tope de equidad del reclamo; alto = sin efecto
+    parametros.setdefault("max_por_clinica", 1000)
+    parametros.setdefault("oferta_slots", None)            # solo las ofertas de horarios llevan valor        # tope de equidad del reclamo; alto = sin efecto
     return parametros
 
 
@@ -133,6 +135,12 @@ if not hay_vector:
     esquema = esquema.replace("vector(1536)", "text")
 c = conectar(autocommit=True)
 c.cursor().execute(esquema)
+# Migraciones posteriores (002_..., 003_...) que estén junto al esquema, en orden.
+import glob
+for _ruta in sorted(glob.glob(os.path.join(os.path.dirname(os.path.abspath(ARGS.esquema)), "[0-9][0-9][0-9]_*.sql"))):
+    if os.path.abspath(_ruta) != os.path.abspath(ARGS.esquema):
+        c.cursor().execute(open(_ruta, encoding="utf-8").read())
+        decir(f"Migración: {_ruta}\n           sha256 {huella(_ruta)}")
 decir(f"Esquema aplicado (pgvector {'presente' if hay_vector else 'ausente: columna sustituida'})\n")
 
 cur = c.cursor()
@@ -160,7 +168,15 @@ def nueva_conversacion(tel):
     return cur.fetchone()[0]
 
 
-def nuevo_mensaje(mid, conv, desfase_s=0, espera_s=0):
+def nueva_oferta(mid, conv, slots):
+    cur.execute("""INSERT INTO mensajes_entrantes
+        (message_id, conversacion_id, texto, enviado_en, estado, intento_actual, intento_valido, respuesta_tipo, respuesta_texto, oferta_slots)
+        VALUES (%s,%s,'ofrecer',now(),'procesado',1,1,'oferta_horarios','lista numerada',%s::bigint[])""", (mid, conv, slots))
+
+
+def nuevo_mensaje(mid, conv, desfase_s=0, espera_s=0, oferta=None):
+    if oferta is not None:
+        nueva_oferta(mid + '.oferta', conv, oferta)
     cur.execute("""INSERT INTO mensajes_entrantes (message_id, conversacion_id, texto, enviado_en, proximo_intento_en)
                    VALUES (%s,%s,'hola', now() + %s * interval '1 second', now() + %s * interval '1 second')""",
                 (mid, conv, desfase_s, espera_s))
@@ -216,7 +232,7 @@ def cerrar(conn, mid, intento, estado_conv=None, motivo=None):
 
 def agendar(conn, mid, intento, slot):
     """Transacción de agendar_cita. La conversación y la clínica se derivan del mensaje.
-    Devuelve 'creada', 'propia', 'ocupado', 'pasado', 'horario_invalido' o 'intento_vencido'."""
+    Devuelve 'creada', 'propia', 'ocupado', 'pasado', 'horario_invalido', 'oferta_no_vigente' o 'intento_vencido'."""
     k = conn.cursor()
     try:
         k.execute(Q("bloquear_conversacion"), P(message_id=mid))
@@ -224,15 +240,31 @@ def agendar(conn, mid, intento, slot):
         k.execute(Q("verificar_intento"), P(message_id=mid, intento=intento))
         if not k.fetchone():
             conn.rollback(); return "intento_vencido"
-        k.execute(Q("agendar_clasificar_horario"), P(conversacion_id=conv, slot_id=slot))
+        k.execute(Q("cita_de_mensaje"), P(message_id=mid))
+        if k.fetchone():
+            conn.commit(); return "propia"
+        k.execute("""SELECT message_id, secuencia, oferta_slots FROM mensajes_entrantes
+                     WHERE conversacion_id=%s AND oferta_slots IS NOT NULL
+                     ORDER BY secuencia DESC LIMIT 1""", (conv,))
+        oferta = k.fetchone()
+        if not oferta or slot not in oferta[2]:
+            conn.rollback(); return "oferta_no_vigente"
+        autorizacion = P(slot_id=slot, conversacion_id=conv, message_id=mid,
+                         oferta_message_id=oferta[0], oferta_secuencia=oferta[1], oferta_slots=oferta[2], opcion=oferta[2].index(slot) + 1)
+        k.execute(Q("agendar_validar_oferta"), autorizacion)
+        if not k.fetchone():
+            conn.rollback(); return "oferta_no_vigente"
+        k.execute(Q("agendar_clasificar_horario"), autorizacion)
         horario = k.fetchone()
         if not horario:
             conn.rollback(); return "horario_invalido"      # no existe o es de otra clínica
         if not horario[1]:
             conn.rollback(); return "pasado"
-        k.execute(Q("agendar_insertar_cita"), P(slot_id=slot, conversacion_id=conv, message_id=mid))
+        k.execute(Q("agendar_insertar_cita"), autorizacion)
         if not k.fetchone():
-            conn.rollback(); return "pasado"                # dejó de ser futuro entre clasificar e insertar
+            k.execute(Q("agendar_validar_oferta"), autorizacion)
+            resultado = "pasado" if k.fetchone() else "oferta_no_vigente"
+            conn.rollback(); return resultado
         k.execute(Q("agendar_subir_estado"), P(conversacion_id=conv))
         conn.commit(); return "creada"
     except errors.UniqueViolation:
@@ -315,7 +347,7 @@ comprobar("al cerrar el primero, se reclama el segundo", r3 and r3[0] == "a.2", 
 cerrar(w2, "a.2", r3[2])
 
 convB = nueva_conversacion("+573000000011")
-nuevo_mensaje("b.1", convB, desfase_s=-30, espera_s=3600)   # el más antiguo espera un reintento
+nuevo_mensaje("b.1", convB, desfase_s=-30, espera_s=3600, oferta=[1, 2, 3])   # el más antiguo espera un reintento
 nuevo_mensaje("b.2", convB, desfase_s=-20)
 comprobar("si el más antiguo espera reintento, el posterior no se adelanta", reclamar(w1) is None)
 cur.execute("UPDATE mensajes_entrantes SET proximo_intento_en = now() WHERE message_id='b.1'")
@@ -352,7 +384,7 @@ cerrar(w2, "b.1", 2, "resuelta_por_ia")
 cur.execute("SELECT estado FROM conversaciones WHERE id=%s", (convB,))
 comprobar("un cierre con estado de menor rango no baja el estado", cur.fetchone()[0] == "cita_agendada")
 
-convC = nueva_conversacion("+573000000012"); nuevo_mensaje("c.1", convC)
+convC = nueva_conversacion("+573000000012"); nuevo_mensaje("c.1", convC, oferta=[S1])
 cur.execute("UPDATE mensajes_entrantes SET proximo_intento_en = now() + interval '1 hour' WHERE message_id='b.2'")
 rc = reclamar(w1)
 comprobar("otro paciente sobre el horario ya tomado recibe 'ocupado'", rc and agendar(w1, rc[0], rc[2], S1) == "ocupado", str(rc))
@@ -360,7 +392,7 @@ cur.execute("UPDATE citas SET estado='cancelada' WHERE slot_id=%s", (S1,))
 comprobar("un horario cancelado se puede volver a reservar", agendar(w1, rc[0], rc[2], S1) == "creada")
 cur.execute("SELECT id FROM slots WHERE inicia_en > now() ORDER BY id DESC LIMIT 1"); SF = cur.fetchone()[0]
 cur.execute("UPDATE slots SET inicia_en = now() - interval '2 hours', termina_en = now() - interval '1 hour' WHERE id=%s", (SF,))
-convD = nueva_conversacion("+573000000013"); nuevo_mensaje("d.1", convD)
+convD = nueva_conversacion("+573000000013"); nuevo_mensaje("d.1", convD, oferta=[SF])
 rd = reclamar(w2)
 comprobar("un horario pasado no se puede agendar", rd and agendar(w2, rd[0], rd[2], SF) == "pasado", str(rd))
 for conn, r in ((w1, rc), (w2, rd)):
@@ -434,7 +466,7 @@ debe_fallar("cita forzada: conversación de una clínica en un horario de otra",
             "INSERT INTO citas (clinica_id, slot_id, conversacion_id, source_message_id) VALUES (%s,%s,%s,'y.1')", (CLIN, SLOT2, convY), errors.ForeignKeyViolation)
 debe_fallar("cita forzada con la clínica del horario y la conversación de otra",
             "INSERT INTO citas (clinica_id, slot_id, conversacion_id, source_message_id) VALUES (%s,%s,%s,'y.1')", (CLIN2, SLOT2, convY), errors.ForeignKeyViolation)
-convX = nueva_conversacion("+573000000015"); nuevo_mensaje("x.1", convX)
+convX = nueva_conversacion("+573000000015"); nuevo_mensaje("x.1", convX, oferta=[SLOT2, 999999999])
 rx = reclamar(w1)
 comprobar("agendar_cita con un horario de otra clínica: 'horario_invalido', no 'pasado'", rx and rx[0] == "x.1" and agendar(w1, "x.1", rx[2], SLOT2) == "horario_invalido", str(rx))
 comprobar("agendar_cita con un horario inexistente: 'horario_invalido'", agendar(w1, "x.1", rx[2], 999999999) == "horario_invalido")
@@ -467,8 +499,10 @@ cur.execute(Q("conocimiento_armar_respuesta"), P(clinica_id=CLIN2, documentos=[D
 comprobar("armar una respuesta con líneas de otra clínica: vacío", cur.fetchall() == [])
 # El horario deja de ser futuro entre la clasificación y la inserción: la inserción se protege sola
 cur.execute("SELECT id FROM slots WHERE inicia_en > now() ORDER BY id LIMIT 1 OFFSET 400"); SLIM = cur.fetchone()[0]
-convT = nueva_conversacion("+573000000018"); nuevo_mensaje("t.1", convT)
-despues = P(slot_id=SLIM, conversacion_id=convT, message_id="t.1")
+convT = nueva_conversacion("+573000000018"); nuevo_mensaje("t.1", convT, oferta=[SLIM])
+cur.execute("SELECT secuencia FROM mensajes_entrantes WHERE message_id='t.1.oferta'"); sec_oferta = cur.fetchone()[0]
+despues = P(slot_id=SLIM, conversacion_id=convT, message_id="t.1", oferta_message_id="t.1.oferta",
+            oferta_secuencia=sec_oferta, oferta_slots=[SLIM], opcion=1)
 despues["ahora"] = datetime(2100, 1, 1, tzinfo=timezone.utc)      # el reloj ya pasó la hora del horario
 cur.execute(Q("agendar_insertar_cita"), despues)
 comprobar("la inserción de la cita no crea nada si el horario ya no es futuro", cur.fetchone() is None)
@@ -570,7 +604,7 @@ decir("\n5. Concurrencia real")
 N = 20
 datos = []
 for i in range(N):
-    cv = nueva_conversacion(f"+5731000000{i:02d}"); nuevo_mensaje(f"carrera.{i}", cv)
+    cv = nueva_conversacion(f"+5731000000{i:02d}"); nuevo_mensaje(f"carrera.{i}", cv, oferta=[S3])
     cur.execute("UPDATE mensajes_entrantes SET estado='procesando', intento_actual=1 WHERE message_id=%s", (f"carrera.{i}",))
     datos.append((f"carrera.{i}", cv))
 salida, barrera = [], threading.Barrier(N)
@@ -587,7 +621,69 @@ n_citas = cur.fetchone()[0]
 comprobar(f"{N} pacientes simultáneos sobre un horario: exactamente una cita",
           n_citas == 1 and salida.count("creada") == 1 and salida.count("ocupado") == N - 1,
           f"creada={salida.count('creada')} ocupado={salida.count('ocupado')}")
-cur.execute("UPDATE mensajes_entrantes SET estado='procesado', intento_valido=1, respuesta_tipo='respaldo', respuesta_texto='x' WHERE message_id LIKE 'carrera.%'")
+cur.execute("UPDATE mensajes_entrantes SET estado='procesado', intento_valido=1, respuesta_tipo='respaldo', respuesta_texto='x' WHERE message_id LIKE 'carrera.%' AND estado='procesando'")
+
+# Consumo de una oferta: dos transacciones y dos slots distintos, misma conversación.
+cv_of = nueva_conversacion("+573600000001")
+cur.execute("SELECT id FROM slots WHERE inicia_en > now() AND id NOT IN (SELECT slot_id FROM citas WHERE estado='agendada') ORDER BY id LIMIT 3 OFFSET 500")
+sl_of = [r[0] for r in cur.fetchall()]
+nueva_oferta("of.O1", cv_of, sl_of)
+nuevo_mensaje("of.a", cv_of); nuevo_mensaje("of.b", cv_of)
+cur.execute("SELECT secuencia FROM mensajes_entrantes WHERE message_id='of.O1'"); sec_of = cur.fetchone()[0]
+permiso_of = P(conversacion_id=cv_of, oferta_message_id="of.O1", oferta_secuencia=sec_of, oferta_slots=sl_of)
+salida_of, barrera_of = [], threading.Barrier(2)
+
+def consumir_of(mid, posicion):
+    conn = conectar(); k = conn.cursor(); barrera_of.wait()
+    k.execute(Q("bloquear_conversacion"), P(message_id=mid))
+    k.execute(Q("agendar_insertar_cita"), dict(permiso_of, message_id=mid, opcion=posicion, slot_id=sl_of[posicion - 1]))
+    salida_of.append(k.fetchone() is not None); conn.commit(); conn.close()
+
+hilos_of = [threading.Thread(target=consumir_of, args=("of.a",1)), threading.Thread(target=consumir_of, args=("of.b",2))]
+[h.start() for h in hilos_of]; [h.join() for h in hilos_of]
+comprobar("misma oferta y slots distintos bajo concurrencia: solo una cita", sorted(salida_of) == [False, True])
+cur.execute("UPDATE citas SET estado='cancelada' WHERE conversacion_id=%s", (cv_of,))
+nuevo_mensaje("of.c", cv_of)
+cur.execute(Q("agendar_insertar_cita"), dict(permiso_of, message_id="of.c", opcion=3, slot_id=sl_of[2]))
+comprobar("cancelar la cita no revive la oferta consumida", cur.fetchone() is None)
+nueva_oferta("of.O2", cv_of, sl_of[::-1]); nuevo_mensaje("of.d", cv_of)
+cur.execute(Q("agendar_insertar_cita"), dict(permiso_of, message_id="of.d", opcion=3, slot_id=sl_of[2]))
+comprobar("una oferta posterior impide volver a O1", cur.fetchone() is None)
+cur.execute("SELECT secuencia FROM mensajes_entrantes WHERE message_id='of.O2'"); sec_o2 = cur.fetchone()[0]
+permiso_o2 = dict(permiso_of, oferta_message_id="of.O2", oferta_secuencia=sec_o2, oferta_slots=sl_of[::-1], message_id="of.d", opcion=1, slot_id=sl_of[2])
+for campo, valor in (("oferta_secuencia", sec_o2 - 1), ("oferta_slots", sl_of), ("opcion", 2), ("slot_id", sl_of[1])):
+    cur.execute(Q("agendar_insertar_cita"), dict(permiso_o2, **{campo: valor}))
+    comprobar("INSERT rechaza identidad/posición alterada: " + campo, cur.fetchone() is None)
+cur.execute(Q("agendar_insertar_cita"), permiso_o2)
+comprobar("una nueva oferta y otra selección crean una segunda cita legítima", cur.fetchone() is not None)
+cur.execute("UPDATE mensajes_entrantes SET proximo_intento_en = now() + interval '1 day' WHERE message_id LIKE 'of.%' AND estado='pendiente'")
+
+# Oferta en espera de selección: se deriva del tipo de las respuestas posteriores.
+def turno_terminado(mid, conv, tipo):
+    cur.execute("""INSERT INTO mensajes_entrantes
+        (message_id, conversacion_id, texto, enviado_en, estado, intento_actual, intento_valido, respuesta_tipo, respuesta_texto)
+        VALUES (%s,%s,'x',now(),'procesado',1,1,%s,'y')""", (mid, conv, tipo))
+
+def oferta_en_espera(prefijo, tipos_posteriores):
+    cv = nueva_conversacion("+5737" + f"{abs(hash(prefijo)) % 10**8:08d}")
+    nueva_oferta(prefijo + ".O", cv, sl_of)
+    for i, tipo in enumerate(tipos_posteriores):
+        turno_terminado(f"{prefijo}.t{i}", cv, tipo)
+    nuevo_mensaje(prefijo + ".x", cv)
+    cur.execute("SELECT secuencia FROM mensajes_entrantes WHERE message_id=%s", (prefijo + ".O",)); sec = cur.fetchone()[0]
+    cur.execute(Q("agendar_validar_oferta"), P(conversacion_id=cv, oferta_message_id=prefijo + ".O", oferta_secuencia=sec,
+                                             oferta_slots=sl_of, message_id=prefijo + ".x", opcion=1, slot_id=sl_of[0]))
+    vale = cur.fetchone() is not None
+    cur.execute("UPDATE mensajes_entrantes SET proximo_intento_en = now() + interval '1 day' WHERE message_id=%s", (prefijo + ".x",))
+    return vale
+
+comprobar("oferta en espera: sin respuestas posteriores, vale", oferta_en_espera("esp.a", []))
+comprobar("oferta en espera: respuestas documentales y 'sin información' posteriores no la anulan",
+          oferta_en_espera("esp.b", ["respuesta_documental", "sin_informacion", "respuesta_documental"]))
+for tipo in ("pregunta_aclaratoria", "sin_disponibilidad", "confirmacion_cita", "escalamiento", "respaldo"):
+    comprobar("oferta en espera: una respuesta posterior de tipo " + tipo + " la anula", not oferta_en_espera("esp." + tipo, [tipo]))
+comprobar("oferta en espera: una pregunta al paciente la anula aunque después haya respuestas documentales",
+          not oferta_en_espera("esp.c", ["pregunta_aclaratoria", "respuesta_documental"]))
 
 # 5b. Ocho workers vacían una cola de 60 conversaciones con 3 mensajes cada una
 cur.execute("UPDATE mensajes_entrantes SET proximo_intento_en = now() + interval '1 day' WHERE estado IN ('pendiente','procesando')")
@@ -716,6 +812,16 @@ comprobar("presupuesto por clínica con rotación: 20 workers vacían 80 mensaje
           f"{len(hechos)} mensajes, máximo visto por los workers {max(maximo_cl.values())}, máximo visto en la base {maximo_bd[0]}")
 
 cur.execute("SELECT conversacion_id FROM mensajes_entrantes WHERE message_id='cola.7.0'"); CV7 = cur.fetchone()[0]
+debe_fallar("oferta de horarios guardada en una respuesta que no es una oferta",
+            "UPDATE mensajes_entrantes SET oferta_slots = ARRAY[1]::bigint[] WHERE message_id = 'cola.7.0'")
+cur.execute("SELECT id FROM slots ORDER BY id LIMIT 1"); SLOT_X = cur.fetchone()[0]
+cur.execute(Q("horario_ofrecido"), P(slot_id=SLOT_X, clinica_id=CLIN)); h_propio = cur.fetchall()
+cur.execute(Q("horario_ofrecido"), P(slot_id=SLOT_X, clinica_id=CLIN2)); h_ajeno = cur.fetchall()
+comprobar("horario ofrecido: se lee con su clínica; con otra clínica, vacío", len(h_propio) == 1 and h_ajeno == [])
+cur.execute(Q("oferta_detalle"), P(slots=[SLOT_X], clinica_id=CLIN)); d_propio = cur.fetchall()
+cur.execute(Q("oferta_detalle"), P(slots=[SLOT_X], clinica_id=CLIN2)); d_ajeno = cur.fetchall()
+comprobar("detalle de la oferta: hora, profesional, sede, especialidad y disponibilidad con su clínica; con otra clínica, vacío",
+          len(d_propio) == 1 and len(d_propio[0]) == 6 and d_ajeno == [])
 cur.execute(Q("bandeja_todas"), P(clinica_id=CLIN))
 comprobar("bandeja sin filtro: devuelve conversaciones de la clínica, la más reciente primero", len(cur.fetchall()) > 0)
 cur.execute(Q("detalle_conversacion"), P(conversacion_id=CV7, clinica_id=CLIN)); propia = cur.fetchall()
@@ -878,6 +984,10 @@ cur.execute("""INSERT INTO conversaciones (clinica_id, telefono, estado, motivo_
                       CASE WHEN g %% 5 = 4 THEN 'sin información' END,
                       now() - (g %% 100000) * interval '1 minute'
                FROM generate_series(1, 200000) g""", (CLIN,))
+# Estadísticas de la tabla referenciada antes de cargar un millón de FK.
+# Evita conservar un plan de comprobación elegido cuando había pocas conversaciones.
+# El ANALYZE general y las mediciones de abajo siguen sin cambios.
+cur.execute("ANALYZE conversaciones")
 cur.execute("""INSERT INTO mensajes_entrantes (message_id, conversacion_id, texto, enviado_en, recibido_en, estado,
                                               intento_actual, intento_valido, respuesta_tipo, respuesta_texto)
                SELECT 'vol.' || c.id || '.' || n, c.id, 'hola', now() - n * interval '1 hour', now() - n * interval '1 hour',
@@ -898,13 +1008,23 @@ decir("  Volumen: %d conversaciones, %d mensajes, %d sin terminar" % cur.fetchon
 
 
 def plan(nombre, sql, params=None, limite_ms=20.0, prohibido=("Seq Scan on mensajes_entrantes", "Seq Scan on conversaciones")):
+    """Plan y tiempo de una sentencia. El tiempo es la MEDIANA de 5 ejecuciones:
+    una sola medición puede salir alta por ruido de la máquina (otra carga, caché
+    fría) sin que el plan haya cambiado. El plan guardado es el de la última.
+    Es una prueba de regresión, no una garantía de latencia: una mediana puede
+    pasar aunque haya ejecuciones lentas, por eso se informa también el rango.
+    No equivale a un percentil 95 ni a un compromiso de servicio."""
     params = P(**(params or {}))
     k = conectar(); kk = k.cursor()
-    kk.execute("EXPLAIN (ANALYZE, BUFFERS) " + sql, params)
-    texto = "\n".join(r[0] for r in kk.fetchall()); k.rollback(); k.close()
-    ms = float(texto.split("Execution Time: ")[1].split(" ms")[0])
+    tiempos = []
+    for _ in range(5):
+        kk.execute("EXPLAIN (ANALYZE, BUFFERS) " + sql, params)
+        texto = "\n".join(r[0] for r in kk.fetchall()); k.rollback()
+        tiempos.append(float(texto.split("Execution Time: ")[1].split(" ms")[0]))
+    k.close()
+    ms = sorted(tiempos)[2]
     malos = [p for p in prohibido if p in texto]
-    comprobar(f"{nombre}: {ms:.2f} ms", ms < limite_ms and not malos, ", ".join(malos))
+    comprobar(f"{nombre}: {ms:.2f} ms (mediana de 5; rango {min(tiempos):.2f} a {max(tiempos):.2f})", ms < limite_ms and not malos, ", ".join(malos))
     return texto
 
 

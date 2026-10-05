@@ -1,8 +1,8 @@
 // Las cinco herramientas del asistente.
 //
 // Idea central: el modelo propone y el código decide. El modelo puede pedir
-// "agenda el H3", pero aquí se comprueba que H3 sea un horario que el código le
-// mostró en este intento, que siga siendo futuro y que nadie lo haya tomado.
+// "agenda la opción 3", pero aquí se exige esa posición en el mensaje completo
+// y en la oferta persistida, que siga siendo futura y que nadie la haya tomado.
 // Cada herramienta valida dos veces:
 //   1. Forma: con el esquema TypeBox (el mismo que se le envió al modelo).
 //   2. Negocio: contra la base de datos.
@@ -15,9 +15,10 @@ import { Kind, Type, TypeRegistry, type TSchema } from '@sinclair/typebox';
 import { Value } from '@sinclair/typebox/value';
 import { ErrorLogico } from '../dominio/errores.js';
 import {
-  DIAS_SEMANA, escribirFecha, escribirHora, fechaLocalDe, rangoDelDia, resolverReferencia, validarFecha,
+  DIAS_SEMANA, escribirFecha, escribirHora, fechaLocalDe, normalizarDiaSemana, rangoDelDia, resolverReferencia, validarFecha,
   type Franja, type ReferenciaFecha,
 } from '../dominio/fechas.js';
+import { extraerPosicion } from '../dominio/seleccion.js';
 import * as plantillas from '../dominio/plantillas.js';
 import { FALTANTES, type Faltante } from '../dominio/plantillas.js';
 import { esViolacionDeUnicidad, revertir } from '../infraestructura/postgres.js';
@@ -71,8 +72,26 @@ export function definirHerramientas(contexto: ContextoIntento): DefinicionHerram
     },
     {
       nombre: 'agendar_cita',
-      descripcion: 'Agenda la cita en un horario devuelto por consultar_disponibilidad en este mismo turno. Solo cuando el paciente ya eligió un horario concreto.',
-      esquema: Type.Object({ horario: Type.String({ pattern: '^H[0-9]{1,3}$' }) }, { additionalProperties: false }),
+      descripcion:
+        'Crea una cita solo con "opcion": debe coincidir con una selección posicional inequívoca del mensaje completo (por ejemplo "2", "la segunda", "opción 3") sobre la última oferta recibida. ' +
+        '"atributos" busca por hora, sede o profesional dentro de esa oferta y produce otra oferta numerada; nunca crea una cita, incluso si hay una sola coincidencia. ' +
+        'Para cualquier otra expresión, pide el número de opción. Las etiquetas H solo sirven para ofrecer horarios, nunca para reservar.',
+      esquema: Type.Object(
+        {
+          opcion: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_HORARIOS })),
+          atributos: Type.Optional(
+            Type.Object(
+              {
+                hora: Type.Optional(Type.String({ pattern: '^([01][0-9]|2[0-3]):[0-5][0-9]$', description: 'Hora en formato de 24 horas, por ejemplo "08:00" o "15:30".' })),
+                sede: Type.Optional(unoDe(contexto.sedes.map((s) => s.nombre))),
+                profesional: Type.Optional(Type.String({ minLength: 2, maxLength: 80, description: 'Nombre o apellido del profesional, como lo dijo el paciente.' })),
+              },
+              { additionalProperties: false, minProperties: 1 },
+            ),
+          ),
+        },
+        { additionalProperties: false },
+      ),
     },
     {
       nombre: 'escalar_a_humano',
@@ -124,6 +143,11 @@ export async function ejecutarHerramienta(
   } catch {
     return { argumentos: argumentosCrudos, salida: error('argumentos_invalidos', 'Los argumentos no son JSON válido.') };
   }
+  // "miércoles" y "sábado" llevan tilde y la lista cerrada no. Se aceptan como el
+  // modelo los escriba: si se rechazan, el modelo pasa a contar los días él mismo
+  // (dias_desde_hoy), y contar es justo lo que no se le confía.
+  const fecha = nombre === 'consultar_disponibilidad' ? (argumentos as { fecha?: { dia_semana?: unknown } } | null)?.fecha : undefined;
+  if (fecha && typeof fecha.dia_semana === 'string') fecha.dia_semana = normalizarDiaSemana(fecha.dia_semana);
   const esquema = definicion.esquema as TSchema;
   if (!Value.Check(esquema, argumentos)) {
     const primero = Value.Errors(esquema, argumentos).First();
@@ -139,7 +163,7 @@ export async function ejecutarHerramienta(
     case 'consultar_disponibilidad':
       return { argumentos, salida: await consultarDisponibilidad(a, contexto, memoria, deps) };
     case 'agendar_cita':
-      return { argumentos, salida: await agendarCita(a.horario, contexto, memoria, deps) };
+      return { argumentos, salida: await agendarCita(a, contexto, memoria, deps) };
     case 'escalar_a_humano':
       // Si en este turno ya se creó una cita, el paciente tiene que recibir su
       // confirmación. Escalar aquí lo dejaría con una cita de la que nadie le habló.
@@ -245,6 +269,7 @@ async function consultarDisponibilidad(
     memoria.horarios.set(etiqueta, { slotId: fila.id, iniciaEn: fila.inicia_en, profesional: fila.profesional, sede: nombreSede, especialidad: especialidad.nombre });
     return { etiqueta, hora: escribirHora(fila.inicia_en, contexto.zona), profesional: fila.profesional, sede: nombreSede };
   });
+  if (memoria.eleccionFallida) memoria.eleccionFallida.consultoDespues = true;
   memoria.ultimaConsulta = { especialidad: especialidad.nombre, sede: sede?.nombre ?? null, fecha, vacia: horarios.length === 0 };
 
   return {
@@ -256,14 +281,49 @@ async function consultarDisponibilidad(
 // --------------------------------------------------------------------------
 // agendar_cita
 // --------------------------------------------------------------------------
-type ResultadoAgendar = 'creada' | 'propia' | 'ocupado' | 'pasado' | 'horario_invalido';
+type ResultadoAgendar = 'creada' | 'propia' | 'ocupado' | 'pasado' | 'horario_invalido' | 'oferta_no_vigente';
 
-async function agendarCita(etiqueta: string, contexto: ContextoIntento, memoria: MemoriaIntento, deps: Dependencias): Promise<Salida> {
+interface Atributos { hora?: string; sede?: string; profesional?: string }
+
+/** Minúsculas, sin tildes y sin tratamientos: "Dra. Laura Gómez" → ["laura", "gomez"]. */
+function palabrasDeNombre(nombre: string): string[] {
+  return nombre.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+    .split(/[^a-z0-9]+/).filter((p) => p && !['dr', 'dra', 'doctor', 'doctora'].includes(p));
+}
+
+function horaLocal24(instante: Date, zona: string): string {
+  return new Intl.DateTimeFormat('en-GB', { timeZone: zona, hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }).format(instante);
+}
+
+async function agendarCita(a: { opcion?: number; atributos?: Atributos }, contexto: ContextoIntento, memoria: MemoriaIntento, deps: Dependencias): Promise<Salida> {
   const { base, reloj } = deps;
-  const horario = memoria.horarios.get(etiqueta);
-  if (!horario) return error('etiqueta_desconocida', `"${etiqueta}" no es un horario devuelto en este turno. Vuelve a usar consultar_disponibilidad.`);
+  // Barrera: si en este intento ya falló la elección del paciente, no se crea
+  // ninguna cita, venga como venga la petición (otra opción o la misma). No depende de que el modelo obedezca: lo impide el código.
+  if (memoria.eleccionFallida) {
+    return error('nueva_eleccion_requerida', 'El horario que eligió el paciente ya no está disponible y en este turno no se puede agendar otro. Usa consultar_disponibilidad y luego responder (oferta_horarios o sin_disponibilidad): el paciente debe elegir de nuevo en su siguiente mensaje.');
+  }
+  if ((a.opcion === undefined) === (a.atributos === undefined)) {
+    return error('argumentos_invalidos', 'Indica exactamente uno: "opcion" para reservar o "atributos" para buscar y ofrecer.');
+  }
   if (memoria.citaCreada) return error('maximo_un_agendamiento_por_mensaje', 'Ya se agendó una cita en este turno. Usa responder con tipo confirmacion_cita.');
+  if (!contexto.ofertaAnterior || contexto.ofertaAnterior.consumida) return error('sin_oferta_previa', 'No hay una oferta en espera de selección: no se ofrecieron horarios, ya se usó, o la conversación pasó a otra pregunta. Usa consultar_disponibilidad y ofrece horarios nuevos; el paciente debe elegir en otro mensaje.');
+  // Los atributos pueden reducir la lista, pero nunca autorizar una reserva.
+  if (a.atributos !== undefined) return resolverPorAtributos(a.atributos, contexto, deps);
 
+  const posicion = extraerPosicion(contexto.texto);
+  // El mensaje no es una selección por número ("ese", "el último"): no se reserva.
+  // El turno termina aquí, con la lista actualizada, para que el paciente dé el número.
+  if (posicion === null) return reofertar(contexto, deps, 'seleccion_no_posicional');
+  if (a.opcion !== posicion) return error('opcion_no_autorizada', 'La opción no coincide con la posición indicada en el mensaje del paciente. Usa esa misma posición; no elijas por él.');
+  const slotId = contexto.ofertaAnterior.slots[posicion - 1];
+  if (slotId === undefined) return error('opcion_desconocida', `La última lista tenía ${contexto.ofertaAnterior.slots.length} opciones. Pide un número de esa lista.`);
+  const horario: { slotId: number; iniciaEn: Date | null } = { slotId, iniciaEn: null };
+
+  const oferta = contexto.ofertaAnterior;
+  const autorizacion = {
+    conversacion_id: contexto.conversacionId, message_id: contexto.messageId, slot_id: horario.slotId,
+    oferta_message_id: oferta.messageId, oferta_secuencia: oferta.secuencia, oferta_slots: oferta.slots, opcion: posicion,
+  };
   let resultado: ResultadoAgendar;
   try {
     resultado = await base.enTransaccion<ResultadoAgendar>(async (tx) => {
@@ -273,13 +333,20 @@ async function agendarCita(etiqueta: string, contexto: ContextoIntento, memoria:
       await tx.ejecutar('bloquear_conversacion', { message_id: contexto.messageId });
       const vigente = await tx.ejecutar('verificar_intento', { message_id: contexto.messageId, intento: contexto.intento });
       if (vigente.length === 0) throw new IntentoVencido();
+      // Una cita del mismo mensaje tiene prioridad sobre el consumo de la oferta.
+      const propia = await tx.ejecutar('cita_de_mensaje', { message_id: contexto.messageId });
+      if (propia.length > 0) return 'propia';
+      if ((await tx.ejecutar('agendar_validar_oferta', autorizacion)).length === 0) return revertir<ResultadoAgendar>('oferta_no_vigente');
 
       const [clasificado] = await tx.ejecutar('agendar_clasificar_horario', { conversacion_id: contexto.conversacionId, slot_id: horario.slotId, ahora });
       if (!clasificado) return revertir<ResultadoAgendar>('horario_invalido');
       if (!clasificado.es_futuro) return revertir<ResultadoAgendar>('pasado');
 
-      const insertada = await tx.ejecutar('agendar_insertar_cita', { conversacion_id: contexto.conversacionId, slot_id: horario.slotId, message_id: contexto.messageId, ahora });
-      if (insertada.length === 0) return revertir<ResultadoAgendar>('pasado');
+      const insertada = await tx.ejecutar('agendar_insertar_cita', { ...autorizacion, ahora });
+      if (insertada.length === 0) {
+        const sigueVigente = await tx.ejecutar('agendar_validar_oferta', autorizacion);
+        return revertir<ResultadoAgendar>(sigueVigente.length > 0 ? 'pasado' : 'oferta_no_vigente');
+      }
 
       await tx.ejecutar('agendar_subir_estado', { conversacion_id: contexto.conversacionId });
       return 'creada';
@@ -293,9 +360,24 @@ async function agendarCita(etiqueta: string, contexto: ContextoIntento, memoria:
     resultado = propia.length > 0 ? 'propia' : 'ocupado';
   }
 
-  if (resultado === 'ocupado') return error('ocupado', 'Ese horario lo acaba de tomar otro paciente. Ofrece otro horario.');
-  if (resultado === 'pasado') return error('pasado', 'Ese horario ya pasó. Ofrece otro horario.');
-  if (resultado === 'horario_invalido') return error('horario_invalido', 'Ese horario no es válido. Vuelve a usar consultar_disponibilidad.');
+  if (resultado === 'oferta_no_vigente') return error('oferta_no_vigente', 'La oferta que vio el paciente ya no está vigente. Consulta y ofrece horarios nuevamente; la nueva selección debe llegar en otro mensaje.');
+  if (resultado !== 'creada' && resultado !== 'propia') {
+    // El horario elegido no se pudo agendar. Se anota cuál era, para decírselo al
+    // paciente, y se cierra la posibilidad de agendar otro en este intento.
+    let hora = horario.iniciaEn;
+    if (!hora) {
+      const [fila] = await base.enTransaccion((tx) => tx.ejecutar('horario_ofrecido', { slot_id: horario.slotId, clinica_id: contexto.clinicaId }), contexto.plazo.paraBase());
+      hora = fila?.inicia_en ?? null;
+    }
+    memoria.eleccionFallida = { slotId: horario.slotId, hora, consultoDespues: false };
+    const motivo = resultado === 'ocupado' ? 'ya lo tomó otro paciente' : resultado === 'pasado' ? 'ya pasó' : 'no es válido';
+    return {
+      resultado: { error: resultado, detalle: `Ese horario ${motivo}. En este turno ya no se puede agendar: usa consultar_disponibilidad y luego responder con oferta_horarios (o sin_disponibilidad si no hay). El paciente elegirá en su siguiente mensaje.` },
+      // Queda en la traza qué horario eligió el paciente y por qué no se agendó:
+      // si la conversación termina con un asesor, puede verlo sin preguntarle de nuevo.
+      real: { resultado, slot_id: horario.slotId, horario_elegido: hora },
+    };
+  }
 
   // Creada (o propia): los datos de la confirmación se leen de la base, no de lo que recuerde el modelo.
   const [cita] = await base.enTransaccion((tx) => tx.ejecutar('cita_de_mensaje', { message_id: contexto.messageId }), contexto.plazo.paraBase());
@@ -303,6 +385,99 @@ async function agendarCita(etiqueta: string, contexto: ContextoIntento, memoria:
   return {
     resultado: { estado: 'cita_agendada', siguiente_paso: 'Usa responder con tipo confirmacion_cita.' },
     real: { resultado, cita_id: cita!.id, slot_id: cita!.slot_id },
+  };
+}
+
+interface OpcionOfrecida { numero: number; slotId: number; iniciaEn: Date; profesional: string; sede: string; especialidad: string; disponible: boolean }
+
+/**
+ * Lee la oferta en espera, en el orden y con el número que vio el paciente.
+ * Bajo el bloqueo de conversación comprueba que siga vigente; si no, devuelve null.
+ */
+async function leerOfertaEnEspera(contexto: ContextoIntento, deps: Dependencias): Promise<OpcionOfrecida[] | null> {
+  const oferta = contexto.ofertaAnterior!;
+  const filas = await deps.base.enTransaccion(
+    async (tx) => {
+      await tx.ejecutar('bloquear_conversacion', { message_id: contexto.messageId });
+      if ((await tx.ejecutar('verificar_intento', { message_id: contexto.messageId, intento: contexto.intento })).length === 0) throw new IntentoVencido();
+      const vigente = await tx.ejecutar('agendar_validar_oferta', {
+        conversacion_id: contexto.conversacionId, message_id: contexto.messageId,
+        oferta_message_id: oferta.messageId, oferta_secuencia: oferta.secuencia, oferta_slots: oferta.slots,
+        opcion: 1, slot_id: oferta.slots[0],
+      });
+      return vigente.length > 0 ? tx.ejecutar('oferta_detalle', { slots: oferta.slots, clinica_id: contexto.clinicaId, ahora: deps.reloj.ahora() }) : null;
+    },
+    contexto.plazo.paraBase(),
+  );
+  if (filas === null) return null;
+  return oferta.slots.flatMap((slotId, i) => {
+    const fila = filas.find((f) => f.id === slotId);
+    return fila ? [{
+      numero: i + 1, slotId, iniciaEn: fila.inicia_en as Date, profesional: fila.profesional as string,
+      sede: fila.sede as string, especialidad: fila.especialidad as string, disponible: fila.disponible as boolean,
+    }] : [];
+  });
+}
+
+/**
+ * Vuelve a presentar la oferta en espera cuando el paciente no dio un número.
+ * No copia la lista anterior: comprueba cada horario contra la agenda de ahora y
+ * solo muestra los que siguen libres, renumerados. Esa lista se guarda como una
+ * oferta nueva, y es la única contra la que vale la próxima elección.
+ */
+async function reofertar(contexto: ContextoIntento, deps: Dependencias, motivo: string): Promise<Salida> {
+  const opciones = await leerOfertaEnEspera(contexto, deps);
+  const libres = (opciones ?? []).filter((o) => o.disponible);
+  if (libres.length === 0) {
+    return error('oferta_no_vigente', 'Los horarios que vio el paciente ya no están disponibles. Usa consultar_disponibilidad y luego responder con oferta_horarios, o sin_disponibilidad si no hay; el paciente debe elegir en otro mensaje.');
+  }
+  return {
+    fin: {
+      tipo: 'oferta_horarios',
+      texto: plantillas.reofertaHorarios(libres[0]!.especialidad, libres, contexto.zona),
+      ofertaSlots: libres.map((o) => o.slotId),
+    },
+    real: { resultado: motivo, slots: libres.map((o) => o.slotId), retirados: opciones!.filter((o) => !o.disponible).map((o) => o.slotId) },
+  };
+}
+
+/** Busca candidatos en la oferta persistida y ofrece una nueva lista; nunca reserva. */
+async function resolverPorAtributos(
+  atributos: Atributos,
+  contexto: ContextoIntento,
+  deps: Dependencias,
+): Promise<Salida> {
+  const buscadas = atributos.profesional === undefined ? [] : palabrasDeNombre(atributos.profesional);
+  if (atributos.profesional !== undefined && buscadas.length === 0) {
+    return error('argumentos_invalidos', '"profesional" debe tener un nombre o un apellido.');
+  }
+  const opciones = await leerOfertaEnEspera(contexto, deps);
+  if (opciones === null) return error('oferta_no_vigente', 'La oferta ya no está vigente. Consulta y ofrece horarios nuevos; el paciente debe elegir en otro mensaje.');
+  const coinciden = opciones.filter((o) => {
+    if (atributos.hora !== undefined && horaLocal24(o.iniciaEn, contexto.zona) !== atributos.hora) return false;
+    if (atributos.sede !== undefined && o.sede !== atributos.sede) return false;
+    const nombre = palabrasDeNombre(o.profesional);
+    return buscadas.every((p) => nombre.includes(p));
+  });
+
+  if (coinciden.length === 0) {
+    return {
+      resultado: {
+        error: 'sin_coincidencia',
+        detalle: 'Ningún horario de la última oferta coincide. Consulta y ofrece otra lista o pide un número de opción.',
+        opciones: opciones.map((o) => ({ opcion: o.numero, hora: horaLocal24(o.iniciaEn, contexto.zona), profesional: o.profesional, sede: o.sede })),
+      },
+    };
+  }
+  // La lista que recibe ahora el paciente y su nueva numeración se congelan juntas.
+  // Incluso una coincidencia única requiere otro mensaje con su número.
+  return {
+    fin: {
+      tipo: 'oferta_horarios',
+      texto: plantillas.aclararHorario(coinciden.map((o, i) => ({ ...o, numero: i + 1 })), contexto.zona),
+      ofertaSlots: coinciden.map((o) => o.slotId),
+    },
+    real: { resultado: 'oferta_por_atributos', atributos, slots: coinciden.map((o) => o.slotId) },
   };
 }
 
@@ -318,6 +493,17 @@ async function responder(
   // Si en este turno se creó una cita, el paciente tiene que enterarse: no se acepta otra respuesta.
   if (memoria.citaCreada && a.tipo !== 'confirmacion_cita') {
     return error('respuesta_no_permitida', 'En este turno se agendó una cita. Usa responder con tipo confirmacion_cita.');
+  }
+  // Si la elección del paciente falló, tiene que enterarse: la única respuesta
+  // válida es la que se lo dice (una oferta nueva, o que no quedan horarios), y
+  // debe salir de una consulta hecha DESPUÉS del fallo.
+  if (memoria.eleccionFallida) {
+    if (a.tipo !== 'oferta_horarios' && a.tipo !== 'sin_disponibilidad') {
+      return error('respuesta_no_permitida', 'El horario que eligió el paciente ya no está disponible. Usa consultar_disponibilidad y luego responder con oferta_horarios, o sin_disponibilidad si no hay horarios.');
+    }
+    if (!memoria.eleccionFallida.consultoDespues) {
+      return error('respuesta_no_permitida', 'Antes de responder vuelve a usar consultar_disponibilidad: la disponibilidad cambió.');
+    }
   }
   switch (a.tipo) {
     case 'respuesta_documental': {
@@ -354,19 +540,27 @@ async function responder(
         if (!horario) return error('etiqueta_desconocida', `"${etiqueta}" no es un horario devuelto en este turno.`);
         elegidos.push(horario);
       }
+      if (memoria.eleccionFallida && elegidos.some((h) => h.slotId === memoria.eleccionFallida!.slotId)) {
+        return error('respuesta_no_permitida', 'No ofrezcas el horario que ya no está disponible.');
+      }
       if (new Set(elegidos.map((h) => h.especialidad)).size > 1) {
         return error('respuesta_no_permitida', 'Una oferta solo puede tener horarios de una misma especialidad.');
       }
       elegidos.sort((x, y) => x.iniciaEn.getTime() - y.iniciaEn.getTime());
       return {
-        fin: { tipo: 'oferta_horarios', texto: plantillas.ofertaHorarios(elegidos[0]!.especialidad, elegidos, contexto.zona) },
+        fin: {
+          tipo: 'oferta_horarios',
+          texto: plantillas.ofertaHorarios(elegidos[0]!.especialidad, elegidos, contexto.zona, memoria.eleccionFallida?.hora ?? null),
+          // Se guarda qué se ofreció y en qué orden: la próxima elección del paciente se resuelve contra esto.
+          ofertaSlots: elegidos.map((h) => h.slotId),
+        },
         real: { slots: elegidos.map((h) => h.slotId) },
       };
     }
     case 'sin_disponibilidad': {
       const consulta = memoria.ultimaConsulta;
       if (!consulta || !consulta.vacia) return error('respuesta_no_permitida', 'sin_disponibilidad solo es válida si la última consulta de disponibilidad de este turno no devolvió horarios.');
-      return { fin: { tipo: 'sin_disponibilidad', texto: plantillas.sinDisponibilidad(consulta.especialidad, consulta.fecha, consulta.sede) } };
+      return { fin: { tipo: 'sin_disponibilidad', texto: plantillas.sinDisponibilidad(consulta.especialidad, consulta.fecha, consulta.sede, contexto.zona, memoria.eleccionFallida?.hora ?? null) } };
     }
     case 'confirmacion_cita': {
       if (!memoria.citaCreada) return error('respuesta_no_permitida', 'No se ha agendado ninguna cita en este turno. Usa agendar_cita primero.');
@@ -374,6 +568,12 @@ async function responder(
     }
     case 'pregunta_aclaratoria': {
       if (!a.faltantes) return error('faltan_datos', 'pregunta_aclaratoria requiere "faltantes".');
+      // Pedir solo el horario cuando hay una oferta en espera es volver a mostrarla.
+      // Una pregunta guardada como tal anularía la oferta y el número que conteste el
+      // paciente no tendría contra qué resolverse.
+      if (a.faltantes.every((f) => f === 'horario') && contexto.ofertaAnterior && !contexto.ofertaAnterior.consumida) {
+        return reofertar(contexto, deps, 'reoferta_por_pregunta');
+      }
       return { fin: { tipo: 'pregunta_aclaratoria', texto: plantillas.preguntaAclaratoria(a.faltantes) } };
     }
     case 'sin_informacion':

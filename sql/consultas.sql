@@ -228,14 +228,15 @@ ORDER BY s.inicia_en
 LIMIT 8;
 
 -- agendar_cita, transacción:
---   bloquear_conversacion → verificar_intento → agendar_clasificar_horario
+--   bloquear_conversacion → verificar_intento → cita_de_mensaje (prioridad propia)
+--   → agendar_validar_oferta (sin fila: oferta_no_vigente) → agendar_clasificar_horario
 --     · sin fila          → ROLLBACK, 'horario_invalido' (no existe o es de otra
---                           clínica; con etiquetas H no debería ocurrir: se
---                           registra como error del código)
+--                           clínica; con una oferta persistida no debería
+--                           ocurrir: se registra como error del código)
 --     · es_futuro = false → ROLLBACK, 'pasado'
 --   → agendar_insertar_cita
---     · sin fila          → ROLLBACK, 'pasado' (dejó de ser futuro entre la
---                           clasificación y la inserción)
+--     · sin fila          → revalidar oferta: 'oferta_no_vigente' o 'pasado'
+--                           (dejó de ser futuro entre clasificación e inserción)
 --     · unique_violation  → ROLLBACK, cita_de_mensaje: 'propia' u 'ocupado'.
 --                           No se confía en cuál restricción reportó Postgres.
 --   :ahora se toma del reloj de la aplicación al empezar ESTA transacción, no al
@@ -246,22 +247,97 @@ LIMIT 8;
 --   "a la fecha de :ahora", determinista y comprobable en tests con reloj fijo.
 --   → agendar_subir_estado → COMMIT, 'creada'
 
+-- name: horario_ofrecido
+-- Hora de un horario que se le ofreció al paciente en un turno anterior, para
+-- poder decirle cuál ya no está disponible. Filtra por la clínica del contexto.
+SELECT s.id, s.inicia_en FROM slots s WHERE s.id = :slot_id AND s.clinica_id = :clinica_id;
+
+-- name: oferta_detalle
+-- Los horarios de la oferta en espera, con lo que el paciente leyó (hora,
+-- profesional, sede). `disponible` dice si hoy se podría reservar: es futuro y
+-- no tiene una cita activa. La búsqueda por atributos no lo usa (se resuelve
+-- contra lo que el paciente vio); la reoferta sí, para no volver a presentar
+-- un horario que ya no está.
+SELECT s.id, s.inicia_en, p.nombre AS profesional, se.nombre AS sede, e.nombre AS especialidad,
+       s.inicia_en > :ahora
+         AND NOT EXISTS (SELECT 1 FROM citas ci WHERE ci.slot_id = s.id AND ci.estado IN ('agendada')) AS disponible
+FROM slots s
+JOIN profesionales p ON p.id = s.profesional_id
+JOIN sedes se ON se.id = p.sede_id
+JOIN especialidades e ON e.id = p.especialidad_id
+WHERE s.id = ANY(:slots::bigint[]) AND s.clinica_id = :clinica_id;
+
 -- name: agendar_clasificar_horario
 SELECT s.clinica_id, s.inicia_en > :ahora AS es_futuro
 FROM slots s
 JOIN conversaciones c ON c.id = :conversacion_id AND c.clinica_id = s.clinica_id
 WHERE s.id = :slot_id;
 
+-- name: agendar_validar_oferta
+-- Bajo el bloqueo de conversación: identidad exacta, oferta en espera de
+-- selección, sin consumo (incluye citas canceladas), posición y slot.
+--
+-- "En espera de selección" se deriva de los tipos de respuesta ya guardados:
+-- después de la oferta solo puede haber respuestas que no cambian de tema
+-- (respuesta_documental, sin_informacion). Cualquier otra respuesta posterior la
+-- anula: otra oferta la reemplaza; una pregunta al paciente (fecha, sede,
+-- especialidad), sin_disponibilidad, una confirmación, un escalamiento o un
+-- respaldo significan que el asistente ya no espera un número de esa lista. Así
+-- "el 5", contestado a "¿para qué día?", no puede reservar la opción 5 de una
+-- oferta vieja. El consumo por cita es una condición aparte: cubre la caída
+-- entre crear la cita y guardar su confirmación.
+SELECT o.message_id
+FROM mensajes_entrantes o
+JOIN mensajes_entrantes actual ON actual.message_id = :message_id
+WHERE o.message_id = :oferta_message_id AND o.secuencia = :oferta_secuencia
+  AND o.conversacion_id = :conversacion_id AND actual.conversacion_id = o.conversacion_id
+  AND o.estado IN ('procesado','fallido') AND o.secuencia < actual.secuencia
+  AND o.oferta_slots = :oferta_slots::bigint[]
+  AND :opcion::int BETWEEN 1 AND cardinality(o.oferta_slots)
+  AND o.oferta_slots[:opcion::int] = :slot_id
+  AND NOT EXISTS (
+    SELECT 1 FROM mensajes_entrantes posterior
+    WHERE posterior.conversacion_id = o.conversacion_id
+      AND posterior.estado IN ('procesado','fallido')
+      AND posterior.respuesta_tipo NOT IN ('respuesta_documental','sin_informacion')
+      AND posterior.secuencia > o.secuencia
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM citas ci JOIN mensajes_entrantes origen ON origen.message_id = ci.source_message_id
+    WHERE ci.conversacion_id = o.conversacion_id AND origen.secuencia > o.secuencia
+  );
+
 -- name: agendar_insertar_cita
--- La inserción se protege sola: solo crea la cita si el horario es de la
--- clínica de la conversación y sigue siendo futuro. La validación y el efecto
--- ocurren en la misma sentencia; la clasificación anterior solo sirve para
--- darle al modelo un error preciso. Sin ON CONFLICT: ningún conflicto queda
--- oculto. La clínica sale de la conversación, no de un parámetro.
+-- La cita es el evento durable de consumo. El INSERT repite la validación de
+-- oferta, clínica y futuro; el índice único del slot protege su disponibilidad.
+-- Las dos sentencias se ejecutan bajo el mismo bloqueo de conversación.
+WITH oferta AS (
+SELECT o.message_id
+FROM mensajes_entrantes o
+JOIN mensajes_entrantes actual ON actual.message_id = :message_id
+WHERE o.message_id = :oferta_message_id AND o.secuencia = :oferta_secuencia
+  AND o.conversacion_id = :conversacion_id AND actual.conversacion_id = o.conversacion_id
+  AND o.estado IN ('procesado','fallido') AND o.secuencia < actual.secuencia
+  AND o.oferta_slots = :oferta_slots::bigint[]
+  AND :opcion::int BETWEEN 1 AND cardinality(o.oferta_slots)
+  AND o.oferta_slots[:opcion::int] = :slot_id
+  AND NOT EXISTS (
+    SELECT 1 FROM mensajes_entrantes posterior
+    WHERE posterior.conversacion_id = o.conversacion_id
+      AND posterior.estado IN ('procesado','fallido')
+      AND posterior.respuesta_tipo NOT IN ('respuesta_documental','sin_informacion')
+      AND posterior.secuencia > o.secuencia
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM citas ci JOIN mensajes_entrantes origen ON origen.message_id = ci.source_message_id
+    WHERE ci.conversacion_id = o.conversacion_id AND origen.secuencia > o.secuencia
+  )
+)
 INSERT INTO citas (clinica_id, slot_id, conversacion_id, source_message_id, creado_en)
 SELECT c.clinica_id, s.id, c.id, :message_id, :ahora
 FROM slots s
 JOIN conversaciones c ON c.id = :conversacion_id AND c.clinica_id = s.clinica_id
+CROSS JOIN oferta
 WHERE s.id = :slot_id AND s.inicia_en > :ahora
 RETURNING id;
 
@@ -283,9 +359,12 @@ WHERE id = :conversacion_id AND rango_estado(estado) < rango_estado('cita_agenda
 
 -- name: cierre_mensaje
 -- :estado_mensaje es 'procesado' o 'fallido'.
+-- :oferta_slots: los horarios ofrecidos, en el orden mostrado, si la respuesta
+-- es una oferta; NULL en cualquier otro caso.
 UPDATE mensajes_entrantes
 SET estado = :estado_mensaje, intento_valido = intento_actual,
-    respuesta_tipo = :respuesta_tipo, respuesta_texto = :respuesta_texto
+    respuesta_tipo = :respuesta_tipo, respuesta_texto = :respuesta_texto,
+    oferta_slots = :oferta_slots
 WHERE message_id = :message_id AND intento_actual = :intento AND estado = 'procesando'
 RETURNING message_id;
 
@@ -397,8 +476,12 @@ ORDER BY t.message_id, t.intento;
 -- name: contexto_ultimos_turnos
 -- Los últimos :n turnos terminados, entregados en orden cronológico. El orden
 -- lo resuelve la consulta para que no dependa de invertir la lista en el código.
-SELECT message_id, texto, respuesta_texto
-FROM (SELECT message_id, texto, respuesta_texto, secuencia
+SELECT message_id, texto, respuesta_texto, respuesta_tipo, oferta_slots, secuencia,
+       oferta_slots IS NOT NULL AND EXISTS (
+         SELECT 1 FROM citas ci JOIN mensajes_entrantes origen ON origen.message_id = ci.source_message_id
+         WHERE ci.conversacion_id = :conversacion_id AND origen.secuencia > ultimos.secuencia
+       ) AS oferta_consumida
+FROM (SELECT message_id, texto, respuesta_texto, respuesta_tipo, oferta_slots, secuencia
       FROM mensajes_entrantes
       WHERE conversacion_id = :conversacion_id AND estado IN ('procesado','fallido')
       ORDER BY secuencia DESC

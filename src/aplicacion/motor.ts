@@ -45,8 +45,9 @@ export function mensajeDeSistema(contexto: ContextoIntento): string {
     '- Si buscar_conocimiento no devuelve fragmentos, o ninguna línea contesta la pregunta, usa responder con tipo sin_informacion. Nunca respondas de memoria, y nunca uses sin_informacion sin haber buscado antes en este turno.',
     '- Para agendar necesitas especialidad y fecha. Si falta alguna, usa responder con tipo pregunta_aclaratoria.',
     '- Con especialidad y fecha, usa consultar_disponibilidad. Si hay horarios, ofrécelos con responder tipo oferta_horarios; si no hay, usa sin_disponibilidad.',
-    '- Solo usa agendar_cita cuando el paciente ya eligió un horario concreto. Antes, vuelve a consultar la disponibilidad en este turno: los horarios de mensajes anteriores no sirven. Después de agendar, usa responder con tipo confirmacion_cita.',
-    '- Fechas: nunca escribas una fecha completa ni un año. Indica solo a qué se refiere el paciente (días desde hoy, día de la semana, o día y mes). Si dice algo que no cabe en esas formas, como "a fin de mes", pide una fecha concreta con pregunta_aclaratoria.',
+    '- Para crear una cita, el mensaje completo del paciente debe ser una selección posicional explícita de la última oferta ("1", "la segunda", "opción 3"). Usa agendar_cita con opcion igual a esa posición. Nunca conviertas una hora, sede, profesional o frase ambigua en opcion. Para referencias por atributos usa agendar_cita con atributos: solo produce una nueva oferta, que el paciente deberá elegir por número en otro mensaje. Una reserva exitosa consume toda la oferta, incluso si la cita se cancela después. Una oferta deja de valer si después de ella le preguntaste otra cosa al paciente (fecha, sede, especialidad) o le dijiste que no había horarios: lo que conteste entonces no es una elección de esa lista. Si no hay oferta vigente, consulta y ofrece primero; espera otra selección en otro mensaje. Las etiquetas H no autorizan reservas. Después de crear una cita usa responder con tipo confirmacion_cita.',
+    '- Si agendar_cita no puede agendar el horario elegido (ocupado o pasado), en ese turno ya no se puede agendar ningún otro: consulta la disponibilidad y ofrece los horarios con responder tipo oferta_horarios, o sin_disponibilidad si no hay. El paciente elegirá en su siguiente mensaje.',
+    '- Fechas: nunca escribas una fecha completa ni un año. Indica solo a qué se refiere el paciente (días desde hoy, día de la semana, o día y mes). Si dice algo que no cabe en esas formas, como "a fin de mes", o pide otro día sin decir cuál, pide una fecha concreta con pregunta_aclaratoria: no elijas la fecha por él ni consultes varias fechas para probar.',
     '- Usa escalar_a_humano si el paciente pide hablar con una persona, describe una urgencia médica, presenta una queja, o pide algo que no es información de la clínica ni agendar una cita.',
     '- No das diagnósticos ni consejos médicos.',
     '',
@@ -58,6 +59,7 @@ export function mensajeDeSistema(contexto: ContextoIntento): string {
     `Especialidades: ${contexto.especialidades.map((e) => e.nombre).join(', ')}.`,
     // Lo único que cambia de un mensaje a otro va al final: todo lo anterior es
     // idéntico entre llamadas y el proveedor puede cobrarlo como entrada en caché.
+    `Oferta del historial: ${contexto.ofertaAnterior ? `secuencia ${contexto.ofertaAnterior.secuencia}, ${contexto.ofertaAnterior.consumida ? 'consumida: no reutilizar' : 'sin consumir'}` : 'ninguna'}.`,
     `Fecha y hora del mensaje en la clínica: ${escribirFecha(hoy)}, ${escribirHora(contexto.enviadoEn, contexto.zona)}.`,
   ].join('\n');
 }
@@ -65,6 +67,7 @@ export function mensajeDeSistema(contexto: ContextoIntento): string {
 export interface TurnoAnterior {
   texto: string;
   respuesta_texto: string;
+  oferta_slots?: (number | string)[] | null;
 }
 
 export async function ejecutarCiclo(contexto: ContextoIntento, historial: TurnoAnterior[], deps: Dependencias, traza: Traza): Promise<ResultadoTurno> {

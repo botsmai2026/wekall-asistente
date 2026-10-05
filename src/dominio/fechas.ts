@@ -19,6 +19,11 @@ export interface FechaLocal {
 export const DIAS_SEMANA = ['lunes', 'martes', 'miercoles', 'jueves', 'viernes', 'sabado', 'domingo'] as const;
 export type DiaSemana = (typeof DIAS_SEMANA)[number];
 
+/** Un día de la semana como está en DIAS_SEMANA: en minúsculas y sin tildes ("Miércoles" → "miercoles"). */
+export function normalizarDiaSemana(texto: string): string {
+  return texto.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+}
+
 /** Las tres formas en que el modelo puede referirse a una fecha. Exactamente una. */
 export type ReferenciaFecha =
   | { dias_desde_hoy: number }

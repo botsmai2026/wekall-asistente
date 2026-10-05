@@ -20,8 +20,27 @@ Para enviar un mensaje sin la interfaz:
 ```bash
 curl -X POST http://localhost:3000/webhooks/messages \
   -H 'Content-Type: application/json' \
-  -d '{"message_id":"prueba-1","from":"+573001112233","text":"¿Cuánto ayuno necesito para el perfil lipídico?","timestamp":"2026-10-06T03:40:00Z"}'
+  -d "{\"message_id\":\"prueba-1\",\"from\":\"+573001112233\",\"text\":\"Cuanto ayuno necesito para el perfil lipidico?\",\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}"
 ```
+
+El comando anterior es para Bash (Linux, macOS, Git Bash o WSL). En PowerShell, el equivalente es:
+
+```powershell
+$cuerpo = @{
+  "message_id" = "prueba-1"
+  "from"       = "+573001112233"
+  "text"       = "Cuanto ayuno necesito para el perfil lipidico?"
+  "timestamp"  = (Get-Date).ToUniversalTime().ToString("s") + "Z"
+} | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri http://localhost:3000/webhooks/messages -ContentType "application/json; charset=utf-8" -Body $cuerpo
+```
+
+La respuesta se ve en la interfaz, o en `GET /api/conversaciones` y `GET /api/conversaciones/:id`.
+
+Dos detalles del ejemplo:
+
+- El `timestamp` es la hora actual: define qué día es "hoy" para el paciente. Con una hora fija, como la del ejemplo del enunciado, "mañana" termina siendo una fecha que ya pasó.
+- El texto va sin tildes para que funcione igual en cualquier terminal. El cuerpo debe llegar en UTF-8, y `curl` en algunas terminales de Windows (Git Bash, por ejemplo) lo envía en otra codificación: la API lo rechaza con 400. La interfaz no tiene ese problema.
 
 Sin `OPENAI_API_KEY`, las bases, la API y la interfaz arrancan igual, pero el worker no: los mensajes quedan en cola y nadie los responde.
 
@@ -34,6 +53,8 @@ docker compose up -d postgres      # crea también la base asistente_test
 npm install
 npm test
 ```
+
+Los tests se conectan a `localhost:5432`. Si en el equipo ya hay otro PostgreSQL en ese puerto, responde ese y no el de Docker: en ese caso indique la base de pruebas con `POSTGRES_URL_PRUEBAS`.
 
 Para probar además el almacén de trazas contra un MongoDB real:
 
@@ -63,7 +84,7 @@ python3 verificacion/verificar.py --dsn "host=localhost port=5432 user=postgres 
 
 | Carpeta | Contenido |
 |---|---|
-| `sql/` | Esquema (`001_esquema.sql`) y todas las sentencias SQL, con nombre (`consultas.sql`, `ingestion.sql`, `seed.sql`). El código no contiene SQL: lo carga de aquí |
+| `sql/` | Esquema y migraciones, que se aplican en orden (`001_esquema.sql`, `002_oferta_slots.sql`), y todas las sentencias SQL, con nombre (`consultas.sql`, `ingestion.sql`, `seed.sql`). El código no contiene SQL: lo carga de aquí |
 | `src/dominio/` | Reglas puras, sin dependencias: fechas, estados, plantillas, categorías de error |
 | `src/aplicacion/` | Webhook, worker, ciclo del asistente, herramientas, relevo, ingestión, lecturas |
 | `src/infraestructura/` | PostgreSQL, MongoDB, OpenAI, y las versiones falsas que usan los tests |
@@ -92,14 +113,14 @@ Clínica Valle Salud, con 2 sedes (Norte y Sur), 3 especialidades (Medicina gene
 
 | Parte | Estado |
 |---|---|
-| Esquema, cola, bloqueos, concurrencia, citas, outbox, búsqueda vectorial | Probado por `verificacion/verificar.py` contra PostgreSQL 16 con pgvector (ver `verificacion/resultado.txt`) |
-| Webhook, worker, herramientas, fechas, plantillas, ingestión, relevo, API | Probado por `npm test` contra PostgreSQL real, con modelo y embeddings falsos |
-| Adaptador de OpenAI | Probado sin red: qué envía y cómo clasifica los errores. No se ha ejecutado contra la API real |
-| Comportamiento del modelo real con el prompt y las herramientas | Sin probar. Requiere una clave |
-| Umbral de similitud (`UMBRAL_SIMILITUD`, 0,3) | Sin calibrar con embeddings reales |
-| Almacén de trazas en MongoDB | Probado solo el caso de Mongo inalcanzable. El test contra un Mongo real existe (`tests/mongo.test.ts`) y no se ha ejecutado |
+| Esquema, cola, bloqueos, concurrencia, citas, outbox, búsqueda vectorial | Probado por `verificacion/verificar.py` contra PostgreSQL 16 con pgvector: 159 de 159 comprobaciones. La salida completa está en `verificacion/resultado.txt` |
+| Webhook, worker, herramientas, fechas, plantillas, ingestión, relevo, API | Probado por `npm test` contra PostgreSQL real, con modelo y embeddings falsos: 176 tests |
+| Adaptador de OpenAI | Probado sin red: qué envía y cómo clasifica los errores. Ejecutado contra la API real con `gpt-4o-mini` y `text-embedding-3-small`. Los errores del proveedor (429, 5xx, clave inválida) no se han provocado contra la API real |
+| Comportamiento del modelo real con el prompt y las herramientas | Probado a mano con `gpt-4o-mini`, en pocas conversaciones: pregunta con y sin respuesta en los documentos, agendamiento por opción, cambio de fecha después de una oferta, pregunta intercalada entre la oferta y la elección, nueva oferta cuando otro paciente toma un horario, y escalamiento. No hay un conjunto de evaluación ni se ha probado otro modelo. Lo observado, con dos fallos que se corrigieron, está en `DECISIONS.md`, sección 5 |
+| Umbral de similitud (`UMBRAL_SIMILITUD`, 0,3) | Sin calibrar. Con embeddings reales solo hay unas pocas búsquedas observadas (`DECISIONS.md`, sección 3.8) |
+| Almacén de trazas en MongoDB | Probado contra MongoDB 7 real (`tests/mongo.test.ts`, con `MONGO_URL_PRUEBAS`). En ejecución, las trazas de las conversaciones reales llegaron a Mongo por el relevo; con Mongo detenido, el paciente recibió su respuesta, la traza se vio desde PostgreSQL y pasó a Mongo al volver |
 | Dependencias | `npm audit` sin vulnerabilidades conocidas, en el servidor y en la interfaz (4 de octubre de 2026) |
-| `docker compose up` | La sintaxis del archivo es válida. La construcción de la imagen y el arranque completo no se han ejecutado |
+| `docker compose up --build` | Ejecutado desde volúmenes vacíos y sobre una base ya preparada: construye la imagen (servidor e interfaz), aplica las migraciones, carga los documentos con embeddings reales y arranca la API y el worker |
 | Interfaz web | Compila, y se revisó a mano contra la API con datos de prueba |
 
 ## Dónde el código precisa o se aparta de `docs/ARQUITECTURA.md`
@@ -120,9 +141,12 @@ Son decisiones tomadas al implementar. Están aquí para revisarlas y, si se man
 | Errores 401, 403 y 404 de OpenAI | Se reintentan como infraestructura y generan una alerta de configuración en el log | Son del despliegue, no del mensaje. Escalar es irreversible: un error corregido en segundos no debe dejar escaladas todas las conversaciones que llegaron mientras tanto |
 | Búsqueda de conocimiento | Una sola sentencia trae fragmentos, documento y líneas (`conocimiento_buscar_con_texto`). Al responder se exige que existan todas las líneas elegidas | Una reingestión simultánea no puede producir un "no hay información" falso ni una respuesta incompleta |
 | `sin_informacion` | Solo se acepta si en ese intento se usó `buscar_conocimiento` | "No tengo esa información" es una afirmación sobre los documentos: no puede salir sin haberlos consultado |
+| Elección sobre una oferta anterior | La oferta se guarda con el mensaje (`sql/002_oferta_slots.sql`). `opcion` debe coincidir con la posición extraída del mensaje completo y se resuelve contra esa oferta | El modelo no puede traducir una hora en número, contradecir al paciente ni remapear una posición tras consultar de nuevo |
+| Elección descrita por hora, sede o profesional | `atributos` busca en la oferta guardada y produce otra oferta persistida y numerada, incluso con una sola coincidencia. Nunca crea una cita | La cita requiere una selección posicional en un mensaje posterior; los atributos añadidos por el modelo no autorizan una reserva |
 | Etiquetas `H` y `F` | Valen dentro del intento y su numeración continúa entre consultas del mismo turno; nunca se reutilizan | Permite ofrecer horarios de dos fechas en un turno, y en la traza una etiqueta nombra siempre un solo dato |
 | Sentencias SQL nuevas | `bandeja_todas`, `detalle_conversacion`, `contexto_clinica`, `contexto_sedes`, `contexto_especialidades`, `conocimiento_buscar_con_texto`; `cita_de_mensaje` trae también los nombres | Las necesitaba la aplicación. El verificador las ejecuta |
 | Parámetros de fecha | El cargador de SQL los envía como `CAST($n AS timestamptz)` | Postgres no puede deducir el tipo en expresiones como `:ahora - interval '1 minute'` |
+| Día de la semana | `dia_semana` se acepta con tilde o mayúsculas (`miércoles`, `Sábado`) y se normaliza antes de validar | Con el modelo real, un `miércoles` rechazado terminó en `dias_desde_hoy` contado por el modelo, y ofreció el martes |
 
 El tope de conversaciones por clínica y la exigencia de `READ COMMITTED` se prueban en `verificacion/verificar.py`, con 20 conexiones simultáneas; los tests de la aplicación no los repiten.
 
@@ -133,3 +157,13 @@ El tope de conversaciones por clínica y la exigencia de `READ COMMITTED` se pru
 - La respuesta del asistente se guarda y se muestra en la interfaz; no se envía a WhatsApp.
 - No hay cancelación ni consulta de citas existentes.
 - La API de consulta no tiene autenticación.
+
+### Selección necesaria para reservar
+
+Una cita nueva requiere que el paciente responda a la última oferta con una posición explícita: `1`, `la 2`, `opción 3`, `el número 4`, `el primero` o `la segunda` (hasta 8). Se acepta un punto o signo de exclamación final. El código extrae la posición del mensaje completo y exige que el argumento `opcion` coincida. Las etiquetas H solo sirven para mostrar horarios.
+
+Las referencias por hora, sede o profesional (`atributos`) producen una nueva oferta numerada; incluso una coincidencia única necesita otra respuesta por número. Se pierde la reserva inmediata por «mañana a las 8», «ese», «el último», frases con condiciones o negaciones y fórmulas fuera de esta gramática. Ante duda no se reserva: se vuelve a mostrar la lista, solo con los horarios de la oferta que siguen libres y renumerada, y se pide el número. Esa lista se guarda como una oferta nueva. Las reservas idempotentes ya creadas se recuperan sin pedir otra selección.
+
+Una posición solo vale mientras el asistente espera la elección de esa oferta. Ese estado se deriva del tipo de las respuestas ya guardadas, sin columnas nuevas: después de la oferta solo puede haber respuestas documentales o «no tengo esa información». Una pregunta al paciente (fecha, sede, especialidad), un «no hay horarios», una confirmación, un escalamiento o un respaldo la anulan, y otra oferta la reemplaza. Así, «el 5» contestado a «¿para qué día desea la cita?» no reserva la opción 5 de una lista anterior. Límite: un «el 5» enviado justo después de la oferta se toma como la opción 5.
+
+Una oferta puede autorizar como máximo una cita nueva. El consumo se deriva de la cita persistida y de la secuencia de su mensaje de origen, incluso antes de guardar la confirmación y aunque después se cancele. El contexto conserva la identidad, secuencia y slots de la última oferta del historial; nunca retrocede a una oferta anterior si la última fue consumida. Bajo el bloqueo de conversación, el INSERT revalida esa misma oferta como la última de la conversación, sin consumir, y comprueba posición, slot, clínica y futuro. La recuperación de una cita propia tiene prioridad. Para otra cita se necesita una oferta posterior y otra selección en otro mensaje. Se mantiene la ventana de historial existente.

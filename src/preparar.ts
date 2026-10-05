@@ -14,24 +14,35 @@ import { BaseDeDatos } from './infraestructura/postgres.js';
 
 const RAIZ = fileURLToPath(new URL('../', import.meta.url));
 
-/** Aplica el esquema una sola vez. La tabla "migraciones" recuerda qué se aplicó. */
+/**
+ * Aplica, en orden, las migraciones de sql/ que aún no se hayan aplicado
+ * (archivos "NNN_nombre.sql"). La tabla "migraciones" recuerda cuáles ya
+ * corrieron, así que ejecutarlo de nuevo no repite ninguna.
+ * Devuelve true si aplicó al menos una.
+ */
 export async function migrar(base: BaseDeDatos): Promise<boolean> {
   const cliente = await base.pool.connect();
   try {
     await cliente.query('CREATE TABLE IF NOT EXISTS migraciones (nombre text PRIMARY KEY, aplicada_en timestamptz NOT NULL DEFAULT now())');
-    const nombre = '001_esquema.sql';
-    const { rowCount } = await cliente.query('SELECT 1 FROM migraciones WHERE nombre = $1', [nombre]);
-    if (rowCount) return false;
-    await cliente.query('BEGIN');
-    try {
-      await cliente.query(readFileSync(`${RAIZ}sql/${nombre}`, 'utf8'));
-      await cliente.query('INSERT INTO migraciones (nombre) VALUES ($1)', [nombre]);
-      await cliente.query('COMMIT');
-    } catch (error) {
-      await cliente.query('ROLLBACK');
-      throw error;
+    const archivos = readdirSync(`${RAIZ}sql/`).filter((a) => /^\d{3}_.*\.sql$/.test(a)).sort();
+    let aplicoAlguna = false;
+    for (const nombre of archivos) {
+      const { rowCount } = await cliente.query('SELECT 1 FROM migraciones WHERE nombre = $1', [nombre]);
+      if (rowCount) continue;
+      // Cada migración y su registro van en una transacción: o quedan las dos cosas, o ninguna.
+      await cliente.query('BEGIN');
+      try {
+        await cliente.query(readFileSync(`${RAIZ}sql/${nombre}`, 'utf8'));
+        await cliente.query('INSERT INTO migraciones (nombre) VALUES ($1)', [nombre]);
+        await cliente.query('COMMIT');
+      } catch (error) {
+        await cliente.query('ROLLBACK');
+        throw error;
+      }
+      console.log(`Migración aplicada: ${nombre}`);
+      aplicoAlguna = true;
     }
-    return true;
+    return aplicoAlguna;
   } finally {
     cliente.release();
   }
@@ -100,7 +111,7 @@ export async function ingerirCarpeta(base: BaseDeDatos, embeddings: GeneradorEmb
 if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const config = leerConfiguracion();
   const base = BaseDeDatos.conectar(config.postgresUrl, 2);
-  console.log((await migrar(base)) ? 'Esquema creado' : 'Esquema: ya estaba aplicado');
+  console.log((await migrar(base)) ? 'Esquema al día' : 'Esquema: ya estaba al día');
   const clinicaId = await sembrar(base, new Date());
   console.log(`Datos de ejemplo listos (clínica ${clinicaId})`);
   if (clinicaId !== config.clinicaId) console.warn(`ATENCIÓN: la clínica de ejemplo es la ${clinicaId} y CLINICA_ID vale ${config.clinicaId}`);

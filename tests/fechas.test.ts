@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { escribirFecha, escribirHora, fechaLocalDe, rangoDelDia, resolverReferencia, validarFecha } from '../src/dominio/fechas.js';
+import { escribirFecha, escribirHora, fechaLocalDe, normalizarDiaSemana, rangoDelDia, resolverReferencia, validarFecha } from '../src/dominio/fechas.js';
 
 const ZONA = 'America/Bogota';
 // 03:40 UTC del 6 de octubre de 2026 = lunes 5 de octubre, 10:40 p. m. en Cali.
@@ -20,6 +20,11 @@ describe('fechas en la zona de la clínica', () => {
     expect(resolverReferencia({ dia_semana: 'viernes' }, HOY)).toEqual({ anio: 2026, mes: 10, dia: 9 });
     // Hoy es lunes: "el lunes" es el de la semana siguiente.
     expect(resolverReferencia({ dia_semana: 'lunes' }, HOY)).toEqual({ anio: 2026, mes: 10, dia: 12 });
+  });
+
+  it('el día de la semana se reconoce con tilde y con mayúsculas', () => {
+    expect(['miércoles', 'Sábado', ' MIÉRCOLES ', 'viernes'].map(normalizarDiaSemana)).toEqual(['miercoles', 'sabado', 'miercoles', 'viernes']);
+    expect(normalizarDiaSemana('pasado mañana')).toBe('pasado manana'); // no valida: lo que no es un día lo rechaza el esquema
   });
 
   it('"el viernes de la otra semana" es el viernes de la semana calendario siguiente', () => {

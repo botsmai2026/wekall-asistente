@@ -8,7 +8,7 @@ Cómo se desplegaría este sistema para 50 clínicas y 20.000 mensajes al día. 
 |---|---|---|
 | Mensajes al mes | 600.000 | 20.000 al día |
 | Pico | 2 a 4,5 mensajes por segundo | 80 % del tráfico en 10 horas, con un factor de pico de 4 a 10 |
-| Duración de un turno | Unos 8 s | 2 o 3 llamadas al modelo de 2 a 3 s cada una. Supuesto: no se ha medido con el modelo real |
+| Duración de un turno | Unos 8 s | 2 o 3 llamadas al modelo de 2 a 3 s cada una. Supuesto de dimensionamiento. Primera ejecución real observada: 2,4 a 5,2 s por turno en una conversación; la muestra es insuficiente para reemplazar el supuesto |
 | Turnos simultáneos en el pico | 18 a 36 | Pico por duración del turno |
 | Tamaño de la base | Menos de 50 GB | Mensajes, agenda y conocimiento de 50 clínicas |
 
@@ -292,13 +292,13 @@ Una conversación típica tiene 4 mensajes del paciente (una pregunta y un agend
 
 Precios en USD por millón de tokens, del nivel de procesamiento estándar y contexto corto, leídos el 4 de octubre de 2026 en la página de precios de OpenAI y en la de cada modelo. No son los precios de los niveles Batch y Flex, que cuestan la mitad (0,05 / 0,005 / 0,25 para `gpt-6-luna`): Batch es asíncrono y Flex es más lento y puede no estar disponible, así que no sirven para responderle a un paciente.
 
-El extremo bajo del rango supone un 60 % de la entrada leída de caché; el alto, que la caché no ahorra nada. Para `gpt-6-luna` existe además un costo de escritura en caché de 0,125 por millón de tokens, mayor que el de la entrada normal. Todavía no se han medido en conversaciones reales los tokens leídos de caché ni los escritos, así que el rango de ese modelo es orientativo y deliberadamente conservador: su extremo alto supone que todo el prefijo se cobra como escritura. La traza de cada intento registra los tokens leídos de caché, para poder medirlo.
+El extremo bajo del rango supone un 60 % de la entrada leída de caché; el alto, que la caché no ahorra nada. Para `gpt-6-luna` existe además un costo de escritura en caché de 0,125 por millón de tokens, mayor que el de la entrada normal. Con ese modelo todavía no se han medido en conversaciones reales los tokens leídos de caché ni los escritos, así que su rango es orientativo y deliberadamente conservador: su extremo alto supone que todo el prefijo se cobra como escritura. La traza de cada intento registra los tokens leídos de caché, para poder medirlo.
 
-El prompt está ordenado para aprovechar la caché: lo que no cambia va primero y la fecha del mensaje al final. El ahorro real depende de cómo el proveedor aplique la caché y no se ha medido.
+El prompt está ordenado para aprovechar la caché: lo que no cambia va primero y la fecha del mensaje al final. El ahorro real depende de cómo el proveedor aplique la caché. Con `gpt-4o-mini`, en las conversaciones de prueba del 4 de octubre de 2026, se leyó de caché alrededor del 60 % de la entrada; son conversaciones cortas y pocas, así que orienta el supuesto pero no lo reemplaza.
 
 **Estado de la decisión.** El valor por defecto del proyecto es `gpt-4o-mini`: acepta los parámetros que usa el adaptador y no tiene aviso de retiro. Es un modelo de 2024. `gpt-6-luna` es más barato y actual, pero OpenAI documenta que solo acepta herramientas en esta API con el razonamiento desactivado; el adaptador ya permite configurarlo.
 
-Ninguno se ha ejecutado con este sistema. Elegir por precio sería elegir a ciegas: lo que importa es que el modelo escoja bien la herramienta y las líneas en español. La decisión correcta es armar un conjunto de 30 a 50 conversaciones de prueba, correrlo con los dos y elegir el más barato que no falle.
+Con este sistema solo se ha ejecutado `gpt-4o-mini`, en conversaciones de prueba hechas a mano; `gpt-6-luna`, no. Elegir por precio sería elegir a ciegas: lo que importa es que el modelo escoja bien la herramienta y las líneas en español. La decisión correcta es armar un conjunto de 30 a 50 conversaciones de prueba, correrlo con los dos y elegir el más barato que no falle.
 
 **Datos.** OpenAI declara que los datos enviados por la API no se usan para entrenar sus modelos salvo que el cliente lo autorice, y que conserva registros de control de abuso 30 días por defecto. Existe retención cero para clientes aprobados.
 

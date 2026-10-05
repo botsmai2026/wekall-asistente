@@ -43,12 +43,13 @@ Consecuencia: Mongo queda fuera del camino crítico. Si se cae, el paciente reci
 
 ### Especificación ejecutable
 
-El esquema y las consultas de este documento están escritos y verificados contra PostgreSQL 16 en la carpeta `especificacion/`:
+El esquema y las consultas de este documento están escritos y verificados contra PostgreSQL 16. Los archivos SQL están en `sql/`; el verificador y sus resultados, en `verificacion/`:
 
 - `001_esquema.sql`: las 12 tablas con sus restricciones, índices y disparadores.
+- `002_oferta_slots.sql`: la columna que guarda, con cada oferta de horarios, cuáles se ofrecieron y en qué orden (sección 7.2).
 - `consultas.sql`: única fuente de las sentencias SQL del asistente (webhook, worker, relevo y lecturas), como bloques con nombre (`-- name:`) y parámetros con nombre. El verificador y la aplicación cargan este mismo archivo; no hay copias del SQL en los tests ni en el código. En el código solo vive el orden en que cada transacción ejecuta las sentencias.
 - `ingestion.sql`: las sentencias de la carga de conocimiento, en el mismo formato. Va aparte porque es otro proceso: en producción corre con un rol de base distinto, el único que puede escribir en las tablas de conocimiento.
-- `verificar.py`: carga el esquema, las consultas y la ingestión que se le indiquen (por defecto, los que están a su lado), imprime la ruta y la huella SHA-256 de cada archivo, y comprueba restricciones, orden, protección contra worker tardío, orden de bloqueos, idempotencia, concurrencia real y planes de ejecución con 200.000 conversaciones y un millón de mensajes. Informa cuántas sentencias de cada archivo ejecutó.
+- `verificar.py`: carga el esquema, las migraciones que lo acompañan, las consultas y la ingestión que se le indiquen (por defecto, los de `sql/`), imprime la ruta y la huella SHA-256 de cada archivo, y comprueba restricciones, orden, protección contra worker tardío, orden de bloqueos, idempotencia, concurrencia real y planes de ejecución con 200.000 conversaciones y un millón de mensajes. Informa cuántas sentencias de cada archivo ejecutó.
 - `benchmark_vectorial.py` y `benchmark_vectorial.txt`: tiempo de la búsqueda vectorial según el tamaño de una clínica, y comparación con un índice aproximado.
 - `resultado.txt`: la salida de la última ejecución, con las huellas de los archivos probados. El número de comprobaciones se lee ahí, no en este documento. Con pgvector instalado se ejecutan todas las sentencias de los dos archivos, incluida la búsqueda vectorial; sin pgvector, el verificador omite esa sección y lo dice.
 - `planes.txt`: la salida de `EXPLAIN (ANALYZE, BUFFERS)` de cada consulta.
@@ -56,7 +57,7 @@ El esquema y las consultas de este documento están escritos y verificados contr
 Dos hallazgos de esa verificación que el documento solo no habría mostrado:
 
 - El índice de la cola se decidió midiendo, en tres pasos. Con solo el índice por conversación, el reclamo ordenaba la cola entera. Un segundo índice por secuencia lo resolvía cuando todos los mensajes estaban listos, pero se degradaba cuando muchos esperaban reintento, porque recorría los que aún no podían tomarse. El índice final ordena por el momento en que el mensaje quedó listo: el reclamo se mantiene por debajo de medio milisegundo con 20.000 mensajes atrasados, estén listos todos, la mitad o el 10 %. `verificar.py` reproduce la comparación y `planes.txt` guarda los valores.
-- Límite conocido de ese índice: mensajes listos pero bloqueados porque el más antiguo de su conversación espera reintento. Con 10.000 en esa situación el reclamo tarda unos 40 ms. Es aceptable frente a los segundos que tarda el modelo. Si en producción la cola pasa a SQS FIFO, eso no se resuelve solo: hay que diseñar el paso de Postgres a SQS, el orden de publicación por conversación, la reentrega y cómo se conserva la protección por intento. Queda para el diseño de AWS.
+- Límite conocido de ese índice: mensajes listos pero bloqueados porque el más antiguo de su conversación espera reintento. Con 10.000 en esa situación el reclamo tarda decenas de milisegundos (el valor de la última ejecución está en `resultado.txt`). Es aceptable frente a los segundos que tarda el modelo. Si en producción la cola pasa a SQS FIFO, eso no se resuelve solo: hay que diseñar el paso de Postgres a SQS, el orden de publicación por conversación, la reentrega y cómo se conserva la protección por intento. Queda para el diseño de AWS.
 - Equidad entre clínicas: el reclamo no toma una conversación de una clínica que ya tiene su máximo de conversaciones en proceso. Así el atraso de una clínica no ocupa todos los workers. Ese filtro solo no garantizaba el tope: con 20 reclamos simultáneos y tope 2 se midieron 20 conversaciones tomadas de la misma clínica, porque cada sentencia ve una fotografía y todas veían el mismo conteo. La primera versión de este documento decía que el exceso era de uno como máximo; era falso. Ahora el reclamo toma un turno por clínica (bloqueo consultivo de transacción) y vuelve a contar antes de poner el candado: el tope es estricto y está probado con 20 workers simultáneos, sin rotación y con ella. Dos límites de esa garantía: cuenta candados vigentes, no procesos (un worker cuyo candado venció no cuenta), y el valor del tope es hoy un parámetro global, no una columna por clínica. Como una conversación en proceso hace una sola llamada al modelo a la vez, este tope es también el máximo de llamadas simultáneas al modelo por clínica. La decisión completa sobre la cola en producción, con sus alternativas, está en `ADR-001-cola-en-produccion.md`.
 - Las mediciones tras actualizaciones masivas se hacen después de limpiar filas muertas, como haría autovacuum. Sin esa limpieza los tiempos suben varias veces: una tabla que funciona como cola necesita autovacuum bien configurado.
 - Una inversión de bloqueos producía un deadlock real: el reclamo bloqueaba conversación y luego mensaje, y `agendar_cita` bloqueaba mensaje y luego conversación. Un worker tardío agendando mientras otro reclamaba la misma conversación terminaba con una de las dos transacciones abortada por Postgres. Se reprodujo, se fijó un orden global (conversación, mensaje, cita) y se probó con 15 carreras sin ningún deadlock.
@@ -64,8 +65,8 @@ Dos hallazgos de esa verificación que el documento solo no habría mostrado:
 
 Alcance de esa verificación, en dos niveles que no deben confundirse:
 
-- **Capa de PostgreSQL, verificada.** Esquema, restricciones, cola, bloqueos, concurrencia, citas, idempotencia, separación por clínica, outbox, ingestión, lecturas y la consulta de búsqueda vectorial con pgvector real: ordena por similitud, filtra por clínica y por modelo, y entrega las líneas literales del fragmento. Que la aplicación descarte los resultados bajo el umbral no está probado: ese código no existe todavía.
-- **Lo que esa verificación no cubre.** La búsqueda se probó con embeddings de prueba deterministas, no con el modelo real: no mide calidad semántica ni calibra el umbral. Tampoco cubre el adaptador del LLM, el ciclo de herramientas, el prompt, Mongo y su relevo, la API ni el frontend. Eso se verifica con los tests del proyecto cuando exista el código.
+- **Capa de PostgreSQL, verificada.** Esquema, restricciones, cola, bloqueos, concurrencia, citas, idempotencia, separación por clínica, outbox, ingestión, lecturas y la consulta de búsqueda vectorial con pgvector real: ordena por similitud, filtra por clínica y por modelo, y entrega las líneas literales del fragmento. Descartar los resultados bajo el umbral no es parte de esta capa: lo hace la aplicación, y lo ejercitan sus tests.
+- **Lo que esa verificación no cubre.** La búsqueda se probó con embeddings de prueba deterministas, no con el modelo real: no mide calidad semántica ni calibra el umbral. Tampoco cubre el adaptador del LLM, el ciclo de herramientas, el prompt, Mongo y su relevo, la API ni el frontend. Eso lo cubren los tests de la aplicación (`npm test`) y, para el modelo real, las conversaciones de prueba que resume el README en "Qué está probado y qué no".
 
 ## 1. Principios
 
@@ -108,7 +109,7 @@ Tres dependencias son interfaces reemplazables en tests: `Reloj`, `ModeloLenguaj
 | `slots` | id, clinica_id, profesional_id, inicia_en, termina_en | `UNIQUE(profesional_id, inicia_en)`; restricción de exclusión: un profesional no tiene horarios solapados; clave compuesta: el horario es de la clínica de su profesional |
 | `citas` | id, clinica_id, slot_id, conversacion_id, source_message_id, estado | Único parcial en `slot_id` donde `estado IN ('agendada')`; `UNIQUE(source_message_id)`; clave foránea compuesta (mensaje, conversación): la cita solo puede estar en la conversación de su mensaje; claves compuestas con `clinica_id`: horario y conversación son de la misma clínica |
 | `conversaciones` | id, clinica_id, telefono, estado, motivo_escalamiento, procesando_hasta, ultima_actividad | `UNIQUE(clinica_id, telefono)`; índice `(estado, ultima_actividad)` para la bandeja |
-| `mensajes_entrantes` | message_id, conversacion_id, secuencia, texto, enviado_en, recibido_en, estado, intento_actual, intento_valido, proximo_intento_en, respuesta_tipo, respuesta_texto | Clave primaria `message_id`; índice `(conversacion_id, secuencia)` para el historial; dos índices parciales donde `estado IN ('pendiente','procesando')` para la cola, uno por conversación y secuencia y otro por momento de quedar listo; disparador que impide modificar identidad, orden, texto y horas; índice `(conversacion_id, recibido_en)` para el límite por teléfono; `CHECK` entre columnas: un mensaje terminado tiene respuesta e intento válido, uno sin terminar no |
+| `mensajes_entrantes` | message_id, conversacion_id, secuencia, texto, enviado_en, recibido_en, estado, intento_actual, intento_valido, proximo_intento_en, respuesta_tipo, respuesta_texto, oferta_slots | Clave primaria `message_id`; índice `(conversacion_id, secuencia)` para el historial; dos índices parciales donde `estado IN ('pendiente','procesando')` para la cola, uno por conversación y secuencia y otro por momento de quedar listo; disparador que impide modificar identidad, orden, texto y horas; índice `(conversacion_id, recibido_en)` para el límite por teléfono; `CHECK` entre columnas: un mensaje terminado tiene respuesta e intento válido, uno sin terminar no; `oferta_slots` (de 1 a 8 horarios, en el orden mostrado) solo existe en una respuesta de tipo `oferta_horarios` |
 | `trazas_pendientes` | message_id, intento, documento (JSON), creado_en, intentos_envio, estado_envio, ultimo_error | `UNIQUE(message_id, intento)`; índice parcial por `creado_en` donde `estado_envio = 'pendiente'`. Outbox transaccional hacia Mongo; normalmente vacía |
 | `documentos` | id, clinica_id, titulo, huella | La huella cubre título, contenido, modelo de embeddings y versión del fragmentador. No guarda el texto |
 | `documento_lineas` | documento_id, numero, texto | Única copia del contenido canónico, una fila por línea. Máximo 500 caracteres por línea (`CHECK`). Un disparador impide editarlas: se reingiere el documento |
@@ -267,6 +268,7 @@ El mismo cierre de 6.4, con respuesta de plantilla: mensaje `fallido` si se agot
 - Fecha y hora actuales en la zona de la clínica, calculadas por el código a partir de la hora del mensaje.
 - Sedes y especialidades reales de la clínica.
 - Últimos 10 turnos (configurable), en orden cronológico: solo texto de paciente y asistente, leídos de Postgres. La consulta ya los entrega ordenados.
+- Si hay una oferta de horarios en espera de selección y si ya se usó (sección 7.2). Es una ayuda para el modelo: la decisión la toma el código al reservar.
 
 La entrada al modelo está acotada pieza por pieza: mensaje de 2.000 caracteres como máximo, 10 turnos de historial, 4 fragmentos de tamaño máximo fijo, 8 horarios por consulta y 5 iteraciones. Antes de cada llamada el código comprueba el total en caracteres contra un máximo configurable; si se supera, es un fallo lógico y el turno se escala. El tope en caracteres es una barrera general y barata, no una cuenta exacta de tokens: el proveedor cuenta sobre lo que finalmente recibe el modelo, que incluye roles, definiciones de herramientas y marcas propias. Por eso el contrato tiene dos niveles:
 
@@ -286,13 +288,19 @@ Los datos operativos nunca se confían al historial: se vuelven a consultar con 
 |---|---|---|
 | `buscar_conocimiento` | pregunta | Fragmentos como `F1`, `F2`…, con sus líneas numeradas (`F1.1`, `F1.2`…), o vacío si ninguno supera el umbral |
 | `consultar_disponibilidad` | especialidad, sede (opcional), fecha, franja (opcional) | La fecha consultada y horarios como `H1`, `H2`…. El modelo usa nombres; tras validarlos, el código consulta la base por identificadores |
-| `agendar_cita` | etiqueta de horario | La cita creada, o un error preciso: `ocupado` (ofrecer otro), `pasado` (ofrecer otro) u `horario_invalido` (volver a consultar la disponibilidad). Un error impreciso llevaría al modelo a corregir lo que no es |
+| `agendar_cita` | exactamente uno: `opcion` o `atributos` | `opcion` solo crea una cita si coincide con la posición extraída del mensaje completo mediante una gramática cerrada y existe en la última oferta persistida. `atributos` busca en esa oferta y produce una nueva oferta numerada, incluso con una sola coincidencia; nunca reserva. Las etiquetas H no autorizan reservas. |
 | `escalar_a_humano` | motivo | Termina el turno. No escribe nada: devuelve la intención de escalar. El cierre del intento, protegido contra workers tardíos, guarda en una sola transacción el estado `escalada`, el motivo y la respuesta fija al paciente (tipo `escalamiento`) |
 | `responder` | tipo y datos del tipo | Termina el turno |
 
 El teléfono y la clínica nunca son argumentos: vienen del contexto del mensaje.
 
-Las etiquetas `F` y `H` valen solo dentro del intento: las de un mensaje anterior no existen en el siguiente. Dentro de un intento la numeración continúa entre consultas y nunca se reutiliza, de modo que una etiqueta nombra un solo dato; cada horario se vuelve a validar en la transacción de agendamiento. El código guarda a qué identificador real corresponde cada una, y la traza registra los reales.
+**Elección sobre una oferta anterior.** Cada oferta se guarda con su respuesta y con los slots en el orden mostrado (`oferta_slots`). La única autorización para una cita nueva es una selección posicional extraída del mensaje completo: números 1–8, «la 2», «opción 3», «el número 4» u ordinales primero/primera hasta octavo/octava, con artículo opcional. Se normalizan mayúsculas, tildes y espacios; se admite un punto o signo de exclamación final. No se aceptan frases compuestas, negaciones, condiciones, referencias por hora ni «ese» o «el último». El argumento `opcion` debe coincidir con lo extraído y no puede remapearse tras una consulta nueva. Si no se reconoce la selección, no se reserva: el turno termina con una oferta nueva, formada por los horarios de la oferta en espera que siguen libres según la agenda de ese momento, renumerados; si no queda ninguno, el modelo debe consultar de nuevo. Lo mismo ocurre si el modelo pide solo el horario con una oferta en espera. `atributos` solo busca y termina el turno con una nueva oferta: los candidatos se renumeran desde 1 y se persisten con esa respuesta, sin filtrar los ocupados para elegir otro por el paciente. La reserva requiere un mensaje posterior. Si la selección autorizada está ocupada, pasada o es inválida, el intento queda cerrado para agendar (`nueva_eleccion_requerida`); debe consultar de nuevo y ofrecer alternativas o informar que no hay horarios, incluyendo el aviso de la elección perdida. Se conservan las salidas por escalamiento y la recuperación de una cita propia sin LLM.
+
+**Oferta en espera de selección.** Una posición solo autoriza una cita mientras el asistente espera la elección de esa oferta. El estado tiene dos valores, sin oferta o esperando la selección de una oferta concreta, y se deriva del `respuesta_tipo` de los turnos terminados, que es inmutable: `oferta_horarios` abre la espera con la oferta nueva; `respuesta_documental` y `sin_informacion` no la cambian; `pregunta_aclaratoria`, `sin_disponibilidad`, `confirmacion_cita`, `escalamiento` y `respaldo` la cierran. La condición está en `agendar_validar_oferta` y se repite dentro del `INSERT`, bajo el bloqueo de conversación; el worker la aplica antes para rechazar temprano. Por eso «el 5», contestado a la pregunta por la fecha, no puede reservar la opción 5 de una oferta anterior. No cubre un «el 5» enviado inmediatamente después de la oferta: ahí el asistente pidió un número y el mensaje es uno.
+
+Una oferta puede autorizar como máximo una cita nueva. El consumo se deriva de la cita persistida y de la secuencia de su mensaje de origen, incluso antes de guardar la confirmación y aunque después se cancele. El contexto conserva la identidad, secuencia y slots de la última oferta del historial; nunca retrocede a una oferta anterior si la última fue consumida. Bajo el bloqueo de conversación, el INSERT revalida esa misma oferta como la última de la conversación, sin consumir, y comprueba posición, slot, clínica y futuro. La recuperación de una cita propia tiene prioridad. Para otra cita se necesita una oferta posterior y otra selección en otro mensaje. Se mantiene la ventana de historial existente.
+
+Las etiquetas `F` y `H` valen solo dentro del intento: las de un mensaje anterior no existen en el siguiente. Dentro de un intento la numeración continúa entre consultas y nunca se reutiliza, de modo que una etiqueta nombra un solo dato; el slot elegido por posición se vuelve a validar en la transacción de agendamiento. El código guarda a qué identificador real corresponde cada una, y la traza registra los reales.
 
 ### 7.3 Fecha
 
@@ -301,7 +309,7 @@ El argumento de fecha acepta exactamente una de tres formas:
 | Forma | Ejemplo del paciente | Quién calcula |
 |---|---|---|
 | `dias_desde_hoy` | "mañana" (1), "en tres días" (3) | El código |
-| `dia_semana`, con `semana` opcional | "el viernes"; "el viernes de la otra semana" | El código. Sin `semana`: próxima ocurrencia sin contar hoy. Con `semana_siguiente`: ese día en la semana calendario siguiente (lunes a domingo) |
+| `dia_semana`, con `semana_siguiente` opcional | "el viernes"; "el viernes de la otra semana" | El código. Sin `semana_siguiente`: próxima ocurrencia sin contar hoy. Con `semana_siguiente`: ese día en la semana calendario siguiente (lunes a domingo). El nombre del día se acepta con tilde o mayúsculas ("miércoles") y se normaliza antes de validar |
 | `dia_mes` (día y mes) | "el 15 de octubre" | El código elige el año: la próxima ocurrencia de esa fecha |
 
 El modelo nunca escribe una fecha completa ni un año.
@@ -313,7 +321,7 @@ Dos relojes:
 
 El código valida formato, que la fecha no sea pasada y que esté dentro del horizonte de la agenda. La franja `mañana` es antes de las 12:00 hora local; `tarde`, desde las 12:00.
 
-Expresiones fuera de las tres formas ("a fin de mes", "en dos semanas") no tienen salida calculada por el modelo: debe pedir una fecha concreta con `pregunta_aclaratoria`. Defensas adicionales: la herramienta devuelve la fecha que consultó, y el paciente ve la fecha explícita antes de confirmar.
+Expresiones fuera de las tres formas ("a fin de mes", "en dos semanas"), o un "mejor otro día" sin decir cuál, no tienen salida calculada por el modelo: debe pedir una fecha concreta con `pregunta_aclaratoria`, sin elegirla ni probar varias fechas. Defensas adicionales: la herramienta devuelve la fecha que consultó, y el paciente ve la fecha explícita antes de confirmar.
 
 ### 7.4 Validación antes de ejecutar
 
@@ -322,7 +330,7 @@ Expresiones fuera de las tres formas ("a fin de mes", "en dos semanas") no tiene
 
 Validaciones de `agendar_cita`:
 
-1. La etiqueta existe en el mapa de este intento.
+1. El mensaje completo del paciente es una selección posicional, `opcion` coincide con ella, y la oferta está en espera de selección y sin consumir.
 2. El horario sigue siendo futuro según el reloj real.
 3. No se superó el máximo de un agendamiento por mensaje.
 4. Una sola transacción, con la hora tomada del reloj de la aplicación al empezarla y usada por todas sus sentencias. El contrato temporal es explícito: la cita se crea si el horario era futuro respecto a ese instante; no se promete que lo siga siendo en el momento exacto de confirmar, porque ninguna comprobación puede garantizar eso. La transacción: bloquea la conversación, verifica que el intento siga siendo el suyo, clasifica el horario para poder dar un error preciso, e inserta. La inserción se protege sola: en la misma sentencia exige que el horario sea de la clínica de la conversación y que siga siendo futuro, de modo que la validación y el efecto no ocurren en momentos distintos. Las dos restricciones únicas deciden el resto.
@@ -405,7 +413,7 @@ Tres categorías:
 | Fallo | Categoría | Resultado |
 |---|---|---|
 | Fecha pasada, sede inexistente, etiqueta desconocida | Validación | El modelo corrige o pregunta |
-| Horario ocupado | Negocio | El modelo ofrece otro |
+| Horario ocupado | Negocio | En ese turno ya no se reserva: el modelo consulta de nuevo y ofrece otros; el paciente elige en otro mensaje |
 | Consulta de disponibilidad vacía | Negocio (no es fallo) | `sin_disponibilidad` |
 | Búsqueda sin fragmentos sobre el umbral | Negocio (no es fallo) | `sin_informacion` o escalar |
 | `responder` no pasa la verificación | Validación | El modelo corrige; cuenta como iteración |
@@ -433,6 +441,7 @@ Tres categorías:
 | Un mensaje crea máximo una cita | `UNIQUE(source_message_id)` y contador por intento |
 | La agenda no tiene horarios duplicados | `UNIQUE(profesional_id, inicia_en)` |
 | El modelo no inventa horarios | Etiquetas `H` del intento; texto por plantilla |
+| La cita es del horario que el paciente eligió | La oferta se guarda con su respuesta; la posición se extrae del mensaje completo y debe coincidir con `opcion`; la oferta debe estar en espera de selección y sin usar, y eso se revalida en la misma sentencia que inserta la cita |
 | El modelo no calcula fechas | Tres formas de fecha resueltas en código |
 | El texto documental enviado no puede diferir del documento | El texto vive en una sola tabla (`documento_lineas`); los fragmentos solo apuntan a líneas y las líneas no se editan |
 | Un mensaje no cambia después de recibido | Disparador en la base: identidad, orden, texto y horas nunca cambian; una vez terminado no cambia nada, incluida la respuesta que recibió el paciente |
@@ -512,6 +521,12 @@ Sin LLM real: modelo falso con guion, embeddings falsos deterministas, reloj fij
 | Duplicado de un mensaje con el teléfono en su límite | 202, no 429 |
 | Llamada al modelo | El adaptador envía el límite de tokens de salida |
 | Texto del modelo fuera de `responder` | No llega al paciente; cuenta como iteración |
+| "El primero" después de que otro paciente tomó ese horario | No se agenda el que ahora ocupa esa posición; se avisa y se ofrece de nuevo |
+| Oferta, pregunta documental y después "opción 2" | La oferta sigue en espera y se reserva su opción 2 |
+| Oferta, "mejor otro día", el asistente pide la fecha y el paciente contesta "el 5" | No se reserva la opción 5 de la oferta anterior |
+| "El último" con un horario de la oferta ya tomado por otro paciente | Oferta nueva solo con los que siguen libres, renumerada; la elección siguiente se resuelve contra ella |
+| Una reserva y después otra posición de la misma oferta | La oferta ya se usó: no crea otra cita, ni aunque la primera se cancele |
+| `dia_semana` escrito como "miércoles" o "Sábado" | Se consulta ese día; no se rechaza |
 
 ## 12. Reglas de implementación
 
@@ -519,7 +534,7 @@ Sin LLM real: modelo falso con guion, embeddings falsos deterministas, reloj fij
 - **Aislamiento en un solo lugar.** `READ COMMITTED` es obligatorio para los protocolos del asistente, y lo declara de forma explícita la función que ejecuta sus sentencias (`enTransaccion`), sin heredarlo del servidor y sin aceptar otro nivel. No es una ley para todo el sistema: una operación futura que necesite otro nivel (un reporte, una conciliación) abre su transacción por otro camino, explícito, que no puede ejecutar estas sentencias. La única excepción actual es la migración del esquema, que no usa ningún protocolo. Es parte de la corrección: varios protocolos bloquean y después leen en otra sentencia, contando con que esa lectura ve lo confirmado durante la espera. En `REPEATABLE READ` se midió el tope por clínica roto (19, 10 y 20 conversaciones con tope 2) y errores de serialización en el reclamo. Los demás protocolos fallarían con un error visible; el tope fallaría en silencio, así que la sentencia que toma el turno de la clínica comprueba el nivel y el worker aborta si no es el correcto. Probado.
 - **Espera del worker.** Sin trabajo, el worker espera un intervalo con variación aleatoria antes de volver a reclamar. Un reclamo rechazado por tope de clínica se reintenta de inmediato, porque la siguiente elección ya descarta esa clínica; tras tres rechazos seguidos, el worker espera igual que si no hubiera trabajo. Así una clínica llena no se convierte en un ciclo sin pausa. "No hay trabajo" y "hay trabajo pero su clínica está llena" producen la misma espera en el worker; donde sí deben distinguirse es en la métrica que decide cuántos workers hay: debe contar solo los mensajes que un worker nuevo podría tomar, no los que esperan cupo de su clínica. Queda como requisito del diseño de escalado. El intervalo concreto se fija con el código.
 - **Tamaño de la traza.** El documento de traza tiene un máximo de 64 KB, impuesto en dos niveles: el código acota lo que guarda de cada resultado de herramienta, y la tabla del outbox rechaza con un `CHECK` cualquier documento mayor. Evita que un resultado grande llene el outbox o choque con el límite de documento de Mongo.
-- **Niveles de verificación.** Base de datos: hecha (ver `resultado.txt`). Aplicación (ciclo, herramientas, prompt, fechas), integraciones (Mongo, pgvector, OpenAI) y sistema completo: pendientes hasta que exista el código.
+- **Niveles de verificación.** Base de datos: `verificar.py` (ver `resultado.txt`). Aplicación (ciclo, herramientas, fechas, plantillas): `npm test`, con modelo y embeddings falsos. Integraciones: pgvector real en el verificador, MongoDB real en `tests/mongo.test.ts`, y el adaptador de OpenAI sin red en `tests/openai.test.ts`. Sistema completo con el modelo real: conversaciones de prueba hechas a mano, no un conjunto de evaluación. El estado de cada nivel está en el README, en "Qué está probado y qué no".
 
 - **Qué reloj valida el tiempo.** Todas las sentencias reciben la hora del reloj de la aplicación, tomada al empezar cada transacción. Alternativa considerada: que la última comprobación de "horario futuro" use el reloj de Postgres, para que la autoridad temporal sea la misma que guarda la cita. Se descartó porque rompe los tests con reloj fijo: el caso del enunciado (6 de octubre a las 03:40 UTC) no podría agendar una vez pasada esa fecha real. El riesgo que cubriría es un desfase de reloj entre servidores, que en AWS es de milisegundos frente a transacciones de segundos. Si se quisiera esa garantía en producción, la forma compatible con los tests es una función de base que devuelva su propio reloj salvo que una prueba lo fije.
 - **Relevo con la transacción abierta: decisión de alcance.** Mientras la aplicación espera a Mongo, la sesión de Postgres está inactiva dentro de una transacción; por eso `idle_in_transaction_session_timeout` sí la corta y libera la fila (probado en `verificar.py`). El límite principal sigue siendo el del driver de Mongo, y el corte de Postgres no cancela la llamada a Mongo en curso: el relevo descarta esa conexión y sigue con otra. Es la opción simple para este volumen, no la más robusta posible: con más caudal se pasaría a reclamar, confirmar, escribir en Mongo y finalizar en otra transacción.
@@ -528,6 +543,8 @@ Sin LLM real: modelo falso con guion, embeddings falsos deterministas, reloj fij
 - **Configuración global y por clínica.** En esta versión, el modelo de lenguaje y el de embeddings son configuración global del despliegue; por clínica solo va la zona horaria. El diseño de producción debe decir qué se configura por clínica (modelo, reglas del agente, estado del conocimiento) y qué es global.
 
 ## 13. Pendiente fuera de este documento
+
+Los tres primeros puntos ya tienen su lugar: el diseño en AWS está en `AWS.md`; el modelo y el costo por conversación, en `DECISIONS.md` y `AWS.md`; el contenido del seed, en `conocimiento/` y `src/preparar.ts`. Se conservan como estaban al cerrar este documento.
 
 - Diseño en AWS, escalabilidad, multi-tenant en producción y costo mensual. Incluye las alertas del outbox: edad de la traza más antigua, tamaño de la tabla y uso de disco, para que una caída larga de Mongo no termine llenando Postgres. También roles de base separados (ingestión solo inserta, worker solo actualiza campos operativos). Para multi-tenant: seguridad a nivel de fila en Postgres y claves foráneas compuestas con `clinica_id`, para que la base impida referencias entre clínicas. En esta versión, con una sola clínica, la separación la aplica el código.
 - Modelo concreto de OpenAI, dimensión del vector y costo por conversación, verificados contra la documentación actual.

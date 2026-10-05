@@ -1,10 +1,12 @@
-Esquema:   /home/claude/wekall-asistente/verificacion/../sql/001_esquema.sql
+Esquema:   /repo/verificacion/../sql/001_esquema.sql
            sha256 0bd230e59b6e9cb5d1297bbae27ad95329806798dd9f979f1443a296b255af18
-Consultas: /home/claude/wekall-asistente/verificacion/../sql/consultas.sql
-           sha256 1a31ec7e4d4ee9fb45a1d7d81da1ca379695e6b21f990e3eeb13e4381671d270  (40 sentencias con nombre)
-Ingestión: /home/claude/wekall-asistente/verificacion/../sql/ingestion.sql
+Consultas: /repo/verificacion/../sql/consultas.sql
+           sha256 2a6d0d9cc8bdf134f4195eb264e861e737472f8c835c8ed9518ac028c541ffc6  (43 sentencias con nombre)
+Ingestión: /repo/verificacion/../sql/ingestion.sql
            sha256 584484e779affc60d16aa14de98a2d65bc7b9a4d1522a340cd8636799ea2a8cb  (5 sentencias con nombre)
 
+Migración: /repo/sql/002_oferta_slots.sql
+           sha256 f32adb934deacdeb0e09e464bb335a2537bb3504dbed3f2f92b6ff24a0e95825
 Esquema aplicado (pgvector presente)
 
 
@@ -111,15 +113,34 @@ Esquema aplicado (pgvector presente)
 
 5. Concurrencia real
   OK    20 pacientes simultáneos sobre un horario: exactamente una cita  [creada=1 ocupado=19]
+  OK    misma oferta y slots distintos bajo concurrencia: solo una cita
+  OK    cancelar la cita no revive la oferta consumida
+  OK    una oferta posterior impide volver a O1
+  OK    INSERT rechaza identidad/posición alterada: oferta_secuencia
+  OK    INSERT rechaza identidad/posición alterada: oferta_slots
+  OK    INSERT rechaza identidad/posición alterada: opcion
+  OK    INSERT rechaza identidad/posición alterada: slot_id
+  OK    una nueva oferta y otra selección crean una segunda cita legítima
+  OK    oferta en espera: sin respuestas posteriores, vale
+  OK    oferta en espera: respuestas documentales y 'sin información' posteriores no la anulan
+  OK    oferta en espera: una respuesta posterior de tipo pregunta_aclaratoria la anula
+  OK    oferta en espera: una respuesta posterior de tipo sin_disponibilidad la anula
+  OK    oferta en espera: una respuesta posterior de tipo confirmacion_cita la anula
+  OK    oferta en espera: una respuesta posterior de tipo escalamiento la anula
+  OK    oferta en espera: una respuesta posterior de tipo respaldo la anula
+  OK    oferta en espera: una pregunta al paciente la anula aunque después haya respuestas documentales
   OK    8 workers: los 180 mensajes se procesan exactamente una vez  [180 reclamos]
   OK    8 workers: nunca dos a la vez en la misma conversación  [0 violaciones]
   OK    8 workers: cada conversación en su orden
   OK    equidad: con tope de 2 por clínica, tras dos de la clínica atrasada se atiende a la otra  [['equidad.a.0', 'equidad.a.1', 'equidad.b.0', None]]
-  OK    equidad: al terminar una conversación, la clínica atrasada recupera su turno  [('equidad.a.2', 110, 1)]
-  OK    presupuesto por clínica: 20 reclamos simultáneos, tope 2, quedan exactamente 2 por clínica  [en proceso [2, 2], admisiones rechazadas por carrera 24]
+  OK    equidad: al terminar una conversación, la clínica atrasada recupera su turno  [('equidad.a.2', 119, 1)]
+  OK    presupuesto por clínica: 20 reclamos simultáneos, tope 2, quedan exactamente 2 por clínica  [en proceso [2, 2], admisiones rechazadas por carrera 23]
   OK    aislamiento: un reclamo en REPEATABLE READ se rechaza y no toma nada
   OK    aislamiento: las conexiones del verificador declaran READ COMMITTED de forma explícita
   OK    presupuesto por clínica con rotación: 20 workers vacían 80 mensajes de 2 clínicas sin pasar nunca de 2 por clínica  [80 mensajes, máximo visto por los workers 2, máximo visto en la base 2]
+  OK    oferta de horarios guardada en una respuesta que no es una oferta
+  OK    horario ofrecido: se lee con su clínica; con otra clínica, vacío
+  OK    detalle de la oferta: hora, profesional, sede, especialidad y disponibilidad con su clínica; con otra clínica, vacío
   OK    bandeja sin filtro: devuelve conversaciones de la clínica, la más reciente primero
   OK    detalle de conversación: con la clínica correcta se lee; con otra clínica, vacío
   OK    contexto de la clínica: zona horaria, y solo sus propias sedes y especialidades  [America/Bogota, 2 sedes, ['dermatologia']]
@@ -154,24 +175,24 @@ Esquema aplicado (pgvector presente)
   Fragmentos para la medición: 10004 (50 clínicas x 200)
 
 8. Planes de ejecución con volumen
-  Volumen: 200152 conversaciones, 1000620 mensajes, 326 sin terminar
-  OK    reclamo del worker: 0.27 ms
-  OK    límite por teléfono: 0.05 ms
-  OK    bandeja por estado: 0.09 ms
-  OK    contexto: últimos 10 turnos: 0.10 ms
-  OK    disponibilidad por especialidad, sede y fecha: 1.35 ms
-  OK    búsqueda vectorial exacta: 200 fragmentos de una clínica entre 10.000: 3.94 ms
-  OK    siguiente traza del outbox: 0.08 ms
-  OK    ¿existe cita de este mensaje?: 0.22 ms
-  OK    reclamo con 20.000 atrasados, todos listos: 0.29 ms
-  OK    reclamo con 50% de la cola esperando reintento: 0.40 ms
-  OK    referencia: mismo escenario con índice solo por secuencia (descartado): 2.49 ms
-  OK    reclamo con 90% de la cola esperando reintento: 0.26 ms
-  OK    referencia: mismo escenario con índice solo por secuencia (descartado): 7.01 ms
-  OK    reclamo con 10.000 mensajes listos pero bloqueados por el más antiguo de su conversación: 37.45 ms
+  Volumen: 200161 conversaciones, 1000677 mensajes, 338 sin terminar
+  OK    reclamo del worker: 0.20 ms (mediana de 5; rango 0.19 a 0.38)
+  OK    límite por teléfono: 0.03 ms (mediana de 5; rango 0.02 a 0.09)
+  OK    bandeja por estado: 0.04 ms (mediana de 5; rango 0.03 a 0.21)
+  OK    contexto: últimos 10 turnos: 0.04 ms (mediana de 5; rango 0.03 a 0.15)
+  OK    disponibilidad por especialidad, sede y fecha: 0.97 ms (mediana de 5; rango 0.75 a 2.34)
+  OK    búsqueda vectorial exacta: 200 fragmentos de una clínica entre 10.000: 1.54 ms (mediana de 5; rango 1.47 a 3.64)
+  OK    siguiente traza del outbox: 0.01 ms (mediana de 5; rango 0.01 a 0.07)
+  OK    ¿existe cita de este mensaje?: 0.09 ms (mediana de 5; rango 0.08 a 0.26)
+  OK    reclamo con 20.000 atrasados, todos listos: 0.08 ms (mediana de 5; rango 0.07 a 0.28)
+  OK    reclamo con 50% de la cola esperando reintento: 0.17 ms (mediana de 5; rango 0.09 a 0.29)
+  OK    referencia: mismo escenario con índice solo por secuencia (descartado): 1.67 ms (mediana de 5; rango 1.56 a 2.22)
+  OK    reclamo con 90% de la cola esperando reintento: 0.08 ms (mediana de 5; rango 0.07 a 0.38)
+  OK    referencia: mismo escenario con índice solo por secuencia (descartado): 3.78 ms (mediana de 5; rango 2.88 a 4.71)
+  OK    reclamo con 10.000 mensajes listos pero bloqueados por el más antiguo de su conversación: 30.19 ms (mediana de 5; rango 28.22 a 32.82)
 
-Sentencias de consultas.sql ejecutadas: 40 de 40
+Sentencias de consultas.sql ejecutadas: 43 de 43
 Sentencias de ingestion.sql ejecutadas: 5 de 5
 Sin ejecutar: ninguna
 
-Resultado: 140 de 140 comprobaciones correctas
+Resultado: 159 de 159 comprobaciones correctas

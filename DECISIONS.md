@@ -2,8 +2,6 @@
 
 Qué decidí, por qué, qué descarté y qué costo acepté. El detalle técnico está en [`docs/ARQUITECTURA.md`](docs/ARQUITECTURA.md), [`docs/ADR-001-cola-en-produccion.md`](docs/ADR-001-cola-en-produccion.md) y [`docs/AWS.md`](docs/AWS.md); aquí está el razonamiento.
 
-> **Nota para Michael antes de entregar.** Este documento es un borrador redactado con IA a partir de las decisiones que tomamos. Las secciones 6 y 7 hablan en tu nombre: léelas, corrige lo que no sea cierto para ti y completa lo marcado como `[POR COMPLETAR]`. Borra esta nota.
-
 ## 1. Lo que hay y lo que no
 
 Construí un asistente que responde preguntas con base en los documentos de una clínica y agenda citas, con todo el recorrido: webhook, cola, worker, herramientas, trazabilidad, interfaz y datos de ejemplo.
@@ -14,7 +12,20 @@ Lo que no hay, dicho de entrada:
 - La respuesta se guarda y se muestra; no se envía a WhatsApp.
 - El webhook y la API no tienen autenticación.
 - El modelo de lenguaje definitivo no está elegido (sección 5).
-- `[POR COMPLETAR: qué ejecutaste tú con tu clave y qué resultado dio — docker compose, conversaciones reales, test de Mongo]`
+
+Qué se ejecutó y quién lo ejecutó. Lo separo porque no es lo mismo, y la sección 6 explica cómo usé la IA.
+
+Lo que ejecuté yo, en mi equipo, el 4 de octubre de 2026 y con mi clave de OpenAI:
+
+- `docker compose up --build`, hasta tener las bases, la API, el worker y la interfaz arriba.
+- Las primeras conversaciones con el modelo real, desde la interfaz: una pregunta con respuesta en los documentos, una sin respuesta, una consulta de disponibilidad, una reserva y un escalamiento. Revisé la respuesta y la traza de cada una. De ahí salió el primer fallo real (sección 6).
+
+Lo que ejecutaron asistentes de IA sobre el repositorio, en mi equipo, y cuyos reportes revisé:
+
+- Los tests de la aplicación: 176 de 176 con PostgreSQL y MongoDB reales. Sin MongoDB se omiten 3 y pasan 173.
+- El verificador de la base de datos: 159 de 159 comprobaciones, con pgvector. La salida está en `verificacion/resultado.txt`.
+- El arranque desde volúmenes vacíos y la prueba con MongoDB detenido: el paciente recibió su respuesta, la traza se pudo leer desde PostgreSQL y pasó a Mongo al volver.
+- La validación final con `gpt-4o-mini`, que repitió los flujos de elección sobre una oferta de horarios y encontró dos fallos que los tests no cubrían (sección 5).
 
 ## 2. La idea que ordena todo lo demás
 
@@ -45,7 +56,7 @@ MongoDB dice qué ocurrió y cuánto costó: una traza por intento, con modelo, 
 
 No existe una transacción que abarque PostgreSQL y Mongo. La traza se guarda en una tabla de PostgreSQL dentro de la misma transacción que cierra el turno, y un proceso aparte la copia a Mongo (patrón outbox).
 
-- **Por qué.** El cierre es atómico: no puede haber respuesta sin traza ni al revés. Si el proceso muere después de escribir en Mongo y antes de borrar la fila, la reenvía y un índice único en Mongo la absorbe.
+- **Por qué.** Cuando un turno termina con una respuesta, PostgreSQL guarda en una sola transacción esa respuesta y la traza pendiente de envío: quedan las dos o ninguna. Mongo no participa en esa transacción. El relevo publica la traza después; si muere tras escribir en Mongo y antes de borrar la fila, la reenvía y un índice único en Mongo la absorbe.
 - **Descarté** escribir en las dos bases desde el worker: un fallo en medio deja una respuesta sin traza, o hace depender al paciente de Mongo.
 - **Costo aceptado.** La traza llega a Mongo hasta un segundo después. La interfaz la muestra de inmediato porque también lee de PostgreSQL. Y el proceso que copia mantiene una transacción abierta mientras espera a Mongo (máximo 3 s); con más caudal lo cambiaría por reclamar, confirmar y luego escribir.
 
@@ -71,6 +82,16 @@ Tres barreras en la base, no en el código:
 - `UNIQUE(source_message_id)`: un mensaje crea como máximo una cita, aunque se reintente.
 - La inserción exige en la misma sentencia que el horario sea futuro y de la clínica de la conversación.
 
+**La elección del paciente también la resuelve el código.** Cuando el asistente ofrece horarios, guarda cuáles ofreció y en qué orden, y esa lista ya no cambia. Una cita nueva solo se crea si el mensaje completo del paciente es una posición de esa lista ("2", "el primero", "opción 3"): el código la extrae del texto, exige que coincida con la que indica el modelo y la traduce al horario que el paciente leyó. Las referencias por hora, sede o profesional no reservan: producen otra lista numerada.
+
+- **La oferta tiene que estar esperando esa elección.** Una respuesta documental en medio no la anula. Una pregunta del asistente (fecha, sede, especialidad), un "no hay horarios" u otra oferta sí: así "el 5", contestado a "¿para qué día?", no reserva la opción 5 de una lista anterior.
+- **Una oferta sirve para una sola cita,** aunque esa cita se cancele después. Otra cita exige otra oferta y otra elección.
+- **Si el horario elegido ya lo tomó otra persona,** ese mensaje ya no puede crear ninguna cita: se le dice al paciente cuál horario ya no está y se le ofrecen los disponibles.
+- **Si el paciente no da un número** ("ese", "el último"), se le vuelve a mostrar la lista solo con los horarios que siguen libres, renumerada.
+- **Costo aceptado.** Reservar exige contestar con un número; "mañana a las 8" o "la de la doctora Mejía" cuestan un mensaje más.
+
+Nada de esto estaba en el diseño inicial: salió de probar con el modelo real y de las revisiones posteriores (sección 6).
+
 Si un worker crea la cita y muere antes de responder, el reintento encuentra la cita y la confirma sin llamar al modelo. Probado con dos pacientes pidiendo el mismo horario a la vez, y con 20 conexiones simultáneas en el verificador de la base.
 
 ### 3.7 Fechas
@@ -80,16 +101,17 @@ El modelo nunca escribe una fecha. Dice a qué se refiere el paciente ("días de
 El caso de la prueba es un test: un mensaje a las 03:40 UTC del 6 de octubre es, en Cali, el 5 a las 10:40 p. m., y "mañana" es el 6. La hora del mensaje define "hoy"; el reloj del servidor decide si la fecha ya pasó.
 
 - **Costo aceptado.** Expresiones como "a fin de mes" no tienen salida: el asistente pide una fecha concreta.
+- **Límite.** En "días desde hoy" el número lo pone el modelo, y si cuenta mal el código no puede saberlo. Ocurrió una vez con el modelo real, después de que el código le rechazara un día de la semana bien escrito (sección 5). La defensa que queda es que el paciente lee la fecha completa en la oferta antes de elegir.
 
 ### 3.8 Conocimiento (RAG) y base vectorial
 
 Uso pgvector dentro del mismo PostgreSQL, con búsqueda exacta.
 
 - **Por qué pgvector.** La búsqueda se filtra por clínica en la misma consulta, con las mismas garantías que el resto de los datos, y no hay otra base que sincronizar.
-- **Por qué búsqueda exacta y no un índice aproximado.** Medí la consulta: 2 ms con 200 fragmentos en una clínica, 40 ms con 5.000. Un índice aproximado puede perder un fragmento relevante, y aquí eso aumenta el riesgo de un "no tengo esa información" falso. Con el tamaño actual la búsqueda exacta cumple la latencia y evita ese costo.
+- **Por qué búsqueda exacta y no un índice aproximado.** La consulta se midió: 2 ms con 200 fragmentos en una clínica, 40 ms con 5.000. Un índice aproximado puede perder un fragmento relevante, y aquí eso aumenta el riesgo de un "no tengo esa información" falso. Con el tamaño actual la búsqueda exacta cumple la latencia y evita ese costo.
 - **El texto vive en un solo lugar,** línea por línea. Los fragmentos que se buscan no guardan texto: apuntan a un rango de líneas. Lo que recibe el paciente no puede diferir del documento.
 - **"No tengo esa información" exige haber buscado** en ese mismo turno.
-- **Sin calibrar:** el umbral de similitud (0,3) es provisional. Solo está probado con embeddings de prueba.
+- **Sin calibrar:** el umbral de similitud (0,3) es provisional. Los tests lo prueban con embeddings de prueba. Con embeddings reales solo hay unas pocas búsquedas observadas, sobre dos preguntas: la sección que responde obtuvo entre 0,64 y 0,68 y la siguiente unos 0,44; una pregunta sin respuesta en los documentos trajo fragmentos de 0,30 a 0,40, y fue el modelo quien eligió "no tengo esa información". Orienta, pero no es una calibración.
 - **Límite conocido:** la ingestión supone un solo proceso por documento. Dos a la vez sobre el mismo documento pierden una versión.
 
 ### 3.9 Cuando el modelo falla
@@ -108,7 +130,7 @@ Tras tres intentos fallidos, el paciente recibe una respuesta fija y la conversa
 
 ### 3.10 Seguridad del asistente
 
-Recorrí las diez categorías del OWASP Top 10 para aplicaciones con LLM (edición 2025). No es una auditoría: es qué hay y qué falta en cada una.
+La revisión recorre las diez categorías del OWASP Top 10 para aplicaciones con LLM (edición 2025). No es una auditoría: es qué hay y qué falta en cada una.
 
 | Riesgo | Qué hay | Qué falta |
 |---|---|---|
@@ -139,13 +161,13 @@ Cada uno existe por una consulta concreta:
 | Fragmentos por clínica y modelo de embeddings | Acotar la búsqueda vectorial a una clínica |
 | En Mongo: único por mensaje e intento; y por clínica, conversación y fecha | Entrega repetida sin duplicados; el detalle de una conversación |
 
-El índice de la cola lo decidí midiendo: la primera versión tardaba de 75 a 140 ms con atraso, y la actual menos de medio milisegundo.
+El índice de la cola se decidió con mediciones: la primera versión tardaba de 75 a 140 ms con atraso, y la actual menos de medio milisegundo.
 
 ### 3.12 Stack
 
 - **TypeScript con Fastify y TypeBox.** Elegí TypeBox sobre Zod porque su esquema ya es JSON Schema: el mismo objeto valida en el servidor y se le envía al modelo como definición de la herramienta. No hay dos definiciones que puedan divergir.
 - **Sin ORM.** El SQL está en archivos, con nombre, y el código lo carga de ahí. El verificador de la base ejecuta esos mismos archivos: lo que se probó es lo que corre.
-- **Sin LangChain.** El ciclo de herramientas ocupa poco más de cien líneas. Prefiero poder explicar cada una.
+- **Sin LangChain.** El ciclo de herramientas ocupa poco más de cien líneas: es lo bastante pequeño como para mantenerlo explícito y auditable dentro del proyecto.
 - **El proveedor de IA está detrás de una interfaz.** Los tests usan un modelo falso con guion; cambiar de proveedor es escribir un archivo.
 
 ### 3.13 AWS
@@ -166,9 +188,11 @@ La regla que seguí: la complejidad debe ser proporcional al problema. A 20.000 
 
 Estimación para 50 clínicas y 600.000 mensajes al mes: entre 690 y 1.030 USD mensuales (14 a 21 USD por clínica). AWS son unos 444, Atlas 58 y el modelo entre 190 y 530.
 
-**Una conversación típica** (4 mensajes del paciente, 9 llamadas al modelo, unos 22.000 tokens de entrada y 400 de salida) cuesta entre 0,0013 y 0,0035 USD, según el modelo y cuánto se aproveche la caché de entrada. Son precios del nivel de procesamiento estándar.
+**Escenario de referencia para costos.** Para estimar usé una conversación de 4 mensajes del paciente, 9 llamadas al modelo, unos 22.000 tokens de entrada y 400 de salida. Es un supuesto de cálculo, no una estadística de uso real. Con él, una conversación cuesta entre 0,0013 y 0,0035 USD, según el modelo y cuánto se aproveche la caché de entrada. Son precios del nivel de procesamiento estándar.
 
-Qué tan firmes son estas cifras: los precios se consultaron el 4 de octubre de 2026; los tokens salen del tamaño medido del prompt con una conversión aproximada, no de llamadas reales; la duración del turno y la forma del pico son supuestos.
+**Mediciones reales.** Estas cifras sí salen del consumo que reporta el proveedor en cada llamada (`usage`), guardado en las trazas. Una conversación de 4 mensajes con `gpt-4o-mini`, el 4 de octubre de 2026: 16.252 tokens de entrada, de los cuales el 61 % se leyó de caché, 269 de salida, entre 2,4 y 5,2 s por turno, y un costo de unos 0,0019 USD. En la validación final, 22 turnos de 8 conversaciones cortas con el mismo modelo sumaron 79.062 tokens de entrada (60 % de caché) y 1.264 de salida, con turnos de 0,8 a 4,1 s. Quedan por debajo del escenario de referencia, pero la muestra es demasiado pequeña para reemplazar los supuestos de dimensionamiento: los orienta.
+
+Qué tan firme es la estimación mensual: los precios se consultaron el 4 de octubre de 2026; los tokens del escenario de referencia salen del tamaño medido del prompt con una conversión aproximada, no de llamadas reales; la duración del turno y la forma del pico son supuestos. Las mediciones reales de arriba no entraron en ese cálculo.
 
 La infraestructura es casi toda costo fijo. El modelo es el costo que crece con el uso.
 
@@ -178,15 +202,39 @@ Usé OpenAI. Los candidatos iniciales son `gpt-4o-mini`, que es el valor por def
 
 No lo doy por decidido. Elegir por precio sería elegir a ciegas: lo que importa aquí es que el modelo escoja bien la herramienta y las líneas, en español. La forma correcta es un conjunto de 30 a 50 conversaciones de prueba (preguntas, agendamientos, fechas relativas, horario ocupado, intentos de inyección, escalamientos), correrlo con los dos y quedarse con el más barato que no falle.
 
-`[POR COMPLETAR: con qué modelo lo probaste y qué observaste]`
+**Lo que se probó con el modelo real.** Solo `gpt-4o-mini` (el proveedor respondió como `gpt-4o-mini-2024-07-18`), con embeddings de `text-embedding-3-small`, en conversaciones de prueba del 4 y el 5 de octubre de 2026. Las primeras las envié yo desde la interfaz; las de la validación final las envió un asistente de IA (Claude Code) al sistema levantado en mi equipo, y lo que sigue resume su reporte y las trazas guardadas. No es una evaluación: son pocos casos, cada uno repetido entre una y tres veces.
+
+Lo que hizo bien:
+
+- Pregunta con respuesta en los documentos (ayuno para el perfil lipídico): respondió con las líneas correctas.
+- Pregunta sin respuesta (precio de una resonancia): eligió "no tengo esa información". No inventó un precio.
+- "Mañana", "el martes" y "el 5" llegaron al código en la forma prevista y se consultó el día correcto. Las citas se crearon por opción numerada.
+- Oferta, pregunta sobre un examen y después "2": reservó la opción 2 de esa misma oferta.
+- Oferta, "mejor otro día", pregunta por la fecha y "el 5": lo tomó como fecha, consultó ese día y ofreció de nuevo. No intentó reservar.
+- "El último" cuando otro paciente ya había tomado un horario de la oferta: no reservó; recibió la lista sin ese horario, renumerada, y su elección siguiente se resolvió contra esa lista.
+- "Quiero hablar con una persona": escaló.
+
+Lo que hizo mal:
+
+- Ante "mejor otro día" consultó cinco días seguidos sin responder, agotó las iteraciones y la conversación terminó con un asesor. Pasó en dos conversaciones de dos. No hubo cita equivocada, pero tampoco respuesta útil. Se agregó al prompt la regla de pedir la fecha; después, tres de tres preguntaron la fecha. Es una regla de interpretación, no una garantía: si el modelo vuelve a hacerlo, el resultado sigue siendo el escalamiento.
+- En dos conversaciones, al responder con líneas de un documento añadió un argumento vacío que el esquema rechaza, y lo corrigió en la llamada siguiente. Cuesta una llamada más en ese turno.
+
+Un fallo del código que el modelo real destapó, en una conversación de seis con "el miércoles":
+
+- **El fallo inicial fue del esquema, no del modelo.** El modelo indicó el día como `miércoles`, con tilde, que es como se escribe. La lista cerrada de días estaba sin tildes y el código lo rechazó.
+- **El error del modelo vino después.** Tras el rechazo dejó de usar el día de la semana y pasó a contar los días él mismo: contó dos en vez de tres y ofreció el martes.
+- **Corrección.** El código acepta ahora el día con tilde o con mayúsculas y lo normaliza antes de validar, con un test que antes fallaba.
+- **Límite que permanece.** Cuando el modelo cuenta días, el código no puede saber si contó bien (sección 3.7). El arreglo quita el motivo que lo llevó a contar en este caso, no el límite.
 
 ## 6. Uso de IA
 
 Usé IA durante todo el proyecto, y creo que lo relevante es cómo.
 
-**El método.** Trabajé con dos asistentes. Uno diseñaba y construía; el otro revisaba cada entrega buscando fallos. Yo llevaba las objeciones de uno al otro con una regla: nadie cede por llegar a un acuerdo, solo ante un argumento o una medición. Primero cerramos la arquitectura y después se escribió el código.
+**El método.** Trabajé con dos asistentes. Uno diseñaba y construía; el otro revisaba cada entrega buscando fallos. Yo llevaba las objeciones de uno al otro con una regla: nadie cede por llegar a un acuerdo, solo ante un argumento o una medición. Antes de implementar cerramos una primera arquitectura y acordamos no reabrir decisiones por opinión. Sí se reabrieron, varias veces, cuando hubo un fallo reproducible, un test que fallaba, una medición o un requisito incumplido: la lógica de reserva cambió cuatro veces por esa vía (más abajo). Al final usé además Codex y Claude Code directamente sobre el repositorio, para revisión adversarial y para la validación final.
 
-**Lo que no acepté sin prueba.** Cuando una afirmación sobre concurrencia o rendimiento importaba, pedí que se ejecutara. De ahí salió un verificador de la base de datos (140 comprobaciones contra PostgreSQL real, con carreras de 20 conexiones; la salida exacta de la última ejecución está en `verificacion/resultado.txt`) y los tests de la aplicación.
+**Quién escribió qué.** La mayor parte del código, de los tests y de esta documentación la escribieron los asistentes, bajo mi dirección. Lo mío fue fijar los requisitos y las reglas de trabajo, decidir entre alternativas, exigir que cada afirmación importante se ejecutara, y probar el sistema con el modelo real.
+
+**Lo que no acepté sin prueba.** Cuando una afirmación sobre concurrencia o rendimiento importaba, pedí que se ejecutara. De ahí salió un verificador de la base de datos (159 comprobaciones contra PostgreSQL real, con carreras de 20 conexiones; la salida exacta de la última ejecución está en `verificacion/resultado.txt`) y los tests de la aplicación.
 
 **Errores de la IA que ese método detectó.** Los incluyo porque muestran por qué no basta con pedir y aceptar:
 
@@ -198,9 +246,15 @@ Usé IA durante todo el proyecto, y creo que lo relevante es cómo.
 - La documentación decía que el umbral de similitud estaba "calibrado". No lo estaba.
 - El diseño de AWS dimensionaba 10 mensajes por tarea cuando el código usa 4.
 
-**Dónde decidí contra una de las dos IA.** `[POR COMPLETAR, con tus palabras. Ejemplos que ocurrieron: pediste comparar Zod y TypeBox y elegiste TypeBox; exigiste cerrar la arquitectura antes de escribir código; mantuviste la numeración continua de las etiquetas de horario frente a la propuesta de reiniciarlas.]`
+**Lo que solo apareció al ejecutar con el modelo real.** En la primera conversación de prueba, ante "El primero", el modelo intentó agendar una etiqueta de un mensaje anterior. El código la rechazó, como estaba previsto, pero el modelo volvió a consultar y agendó el primero de la lista nueva. Funcionó por casualidad: con otro paciente reservando entre los dos mensajes, habría agendado una hora distinta de la que el paciente eligió. Ninguna de las rondas de revisión lo había visto. La primera corrección propuesta fue ajustar el prompt; la descarté porque dejaba la garantía en manos del modelo. La segunda guardaba la oferta y resolvía la opción en el código, y pasó todos los tests. Una revisión adversarial con otra herramienta mostró que seguía incompleta: después del rechazo, el modelo todavía podía agendar otra opción o un horario de una consulta nueva dentro del mismo mensaje. La versión final cierra el turno para agendar en cuanto la elección falla, y tiene tests que reproducen las dos formas de saltársela. Quedaba un tercer caso: «la de las 8» con dos horarios a las 8:00. La búsqueda por atributos evitaba elegir si había dos coincidencias, pero la revisión reprodujo otras vías: una etiqueta H podía elegir sede sin autorización, `opcion` podía contradecir el mensaje, y un atributo añadido por el modelo podía hacer única la coincidencia. La autorización ahora se extrae determinísticamente del mensaje completo y debe coincidir con `opcion`. Las etiquetas H no crean citas; los atributos solo producen ofertas persistidas, incluso con una sola coincidencia. Esto sacrifica la reserva inmediata por hora/profesional y exige una elección posicional posterior. Una revisión posterior encontró otro caso: tras una oferta, el paciente dice «mejor otro día», el asistente pregunta la fecha y el paciente contesta «el 5». El texto es una posición válida, y si el modelo lo tomaba como la opción 5 se creaba la cita. Ahora una posición solo vale mientras el asistente espera la elección de esa oferta, y eso se deduce de los tipos de respuesta ya guardados: una pregunta al paciente la anula; una respuesta documental no. Y la validación final con el modelo real, que repitió esos flujos, encontró dos fallos más que ningún test cubría: uno del prompt y otro del código (sección 5). Lo que aprendí: una suite en verde solo prueba lo que cubre.
 
-**Lo que la IA no puede darme.** `[POR COMPLETAR: qué ejecutaste y comprobaste tú mismo, y qué partes puedes explicar línea por línea.]`
+**Dónde decidí contra una recomendación de la IA.**
+
+- Pedí comparar Zod y TypeBox antes de aceptar la propuesta inicial, y elegí TypeBox (sección 3.12).
+- Exigí cerrar una primera arquitectura antes de escribir código.
+- Ante "El primero", no acepté la corrección que solo ajustaba el prompt: la garantía tenía que quedar en el código.
+- Con el caso de "el 5", un asistente recomendó esperar a ver si el modelo real se equivocaba antes de cambiar el código. Decidí corregirlo de inmediato: que un fallo necesite un error del modelo no es una defensa, porque la capa determinista existe para contener esos errores.
+- Para volver a mostrar una oferta, descarté las dos primeras propuestas (reconocer la pregunta por su texto, y repetir la lista anterior tal cual) y pedí que se comprobara la disponibilidad de ese momento.
 
 ## 7. Qué haría distinto
 
@@ -211,7 +265,3 @@ Con más tiempo, en este orden:
 3. Verificación de la firma del webhook y autenticación del coordinador.
 4. Seguridad a nivel de fila en PostgreSQL, para que el aislamiento entre clínicas no dependa de que cada consulta filtre.
 5. El envío real a WhatsApp, con su propia idempotencia.
-
-Y dos cosas que cambiaría de cómo trabajé:
-
-- `[POR COMPLETAR: tu propia reflexión. Una posible, si la compartes: la revisión de la capa de base de datos tomó muchas rondas y dejó poco tiempo para probar con el modelo real, que es donde está la mayor incertidumbre.]`
