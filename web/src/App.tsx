@@ -6,6 +6,20 @@
 import { useEffect, useState } from 'react';
 import { detallar, enviarMensaje, listar, type Conversacion, type Detalle, type Estado, type Intento, type Mensaje } from './api';
 
+function calcularCostoUsd(
+  tokensEntrada: number,
+  tokensSalida: number,
+  tokensCache: number = 0,
+) {
+  const entradaNoCache = Math.max(0, tokensEntrada - tokensCache);
+
+  return (
+    (entradaNoCache / 1_000_000) * 0.15 +
+    (tokensCache / 1_000_000) * 0.075 +
+    (tokensSalida / 1_000_000) * 0.60
+  );
+}
+
 const ESTADOS: { valor: Estado | ''; nombre: string }[] = [
   { valor: '', nombre: 'Todas' },
   { valor: 'en_curso', nombre: 'En curso' },
@@ -43,6 +57,18 @@ export function App() {
   const [filtro, setFiltro] = useState<Estado | ''>('');
   const [seleccion, setSeleccion] = useState<number | null>(null);
   const bandeja = useConsulta(() => listar(filtro), [filtro]);
+  
+  const todas = useConsulta(() => listar(''), []);
+
+  const contar = (estado: Estado | '') => {
+    if (!todas.datos) return 0;
+
+    if (estado === '') {
+      return todas.datos.length;
+    }
+
+    return todas.datos.filter((c) => c.estado === estado).length;
+  };
 
   return (
     <div className="pagina">
@@ -54,8 +80,12 @@ export function App() {
         <section className="bandeja">
           <div className="filtros">
             {ESTADOS.map((e) => (
-              <button key={e.valor} className={filtro === e.valor ? 'activo' : ''} onClick={() => setFiltro(e.valor)}>
-                {e.nombre}
+              <button
+                key={e.valor}
+                className={filtro === e.valor ? 'activo' : ''}
+                onClick={() => setFiltro(e.valor)}
+              >
+                {e.nombre} ({contar(e.valor)})
               </button>
             ))}
           </div>
@@ -130,7 +160,15 @@ function TrazaIntento({ intento }: { intento: Intento }) {
         {intento.motivo && ` (${intento.motivo})`} · {intento.resultado_procesamiento} · leído de {intento.origen === 'mongo' ? 'Mongo' : 'PostgreSQL (aún no publicado)'}
       </p>
       <p className="medicion">
-        modelo: {intento.modelo ?? 'ninguno'} · tokens de entrada: {intento.tokens_entrada} ({intento.tokens_entrada_en_cache ?? 0} de caché) · tokens de salida: {intento.tokens_salida} · latencia: {intento.latencia_ms} ms
+        modelo: {intento.modelo ?? 'ninguno'} ·
+        tokens de entrada: {intento.tokens_entrada} ({intento.tokens_entrada_en_cache ?? 0} de caché) ·
+        tokens de salida: {intento.tokens_salida} ·
+        costo estimado: US$
+        {calcularCostoUsd(
+          intento.tokens_entrada,
+          intento.tokens_salida,
+          intento.tokens_entrada_en_cache ?? 0,
+        ).toFixed(6)}
       </p>
       {intento.error && <p className="aviso">Error: {intento.error}</p>}
       {intento.llamadas.map((llamada, n) => (
