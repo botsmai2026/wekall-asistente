@@ -129,7 +129,7 @@ Clínica Valle Salud, con 2 sedes (Norte y Sur), 3 especialidades (Medicina gene
 | Parte | Estado |
 |---|---|
 | Esquema, cola, bloqueos, concurrencia, citas, outbox, búsqueda vectorial | Probado por `verificacion/verificar.py` contra PostgreSQL 16 con pgvector: 159 de 159 comprobaciones. La salida completa está en `verificacion/resultado.txt` |
-| Webhook, worker, herramientas, fechas, plantillas, ingestión, relevo, API | Probado por `npm test` contra PostgreSQL real, con modelo y embeddings falsos: 181 tests |
+| Webhook, worker, herramientas, fechas, plantillas, ingestión, relevo, API | Probado por `npm test` contra PostgreSQL real, con modelo y embeddings falsos: 191 tests |
 | Adaptador de OpenAI | Probado sin red: qué envía y cómo clasifica los errores. Ejecutado contra la API real con `gpt-4o-mini` y `text-embedding-3-small`. Los errores del proveedor (429, 5xx, clave inválida) no se han provocado contra la API real |
 | Comportamiento del modelo real con el prompt y las herramientas | Probado a mano con `gpt-4o-mini`, en pocas conversaciones: pregunta con y sin respuesta en los documentos, agendamiento por opción, cambio de fecha después de una oferta, pregunta intercalada entre la oferta y la elección, nueva oferta cuando otro paciente toma un horario, y escalamiento. No hay un conjunto de evaluación ni se ha probado otro modelo. Lo observado, con dos fallos que se corrigieron, está en `DECISIONS.md`, sección 5 |
 | Umbral de similitud (`UMBRAL_SIMILITUD`, 0,3) | Sin calibrar. Con embeddings reales solo hay unas pocas búsquedas observadas (`DECISIONS.md`, sección 3.8) |
