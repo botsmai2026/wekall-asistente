@@ -1,6 +1,6 @@
 # Diseño en AWS
 
-Cómo se desplegaría este sistema para 50 clínicas y 20.000 mensajes al día. Es un diseño: nada de esto está desplegado ni probado. Los precios se consultaron el 4 de octubre de 2026 en las páginas oficiales de cada proveedor, para la región `us-east-1`; los que no se pudieron confirmar en una página oficial están marcados.
+Cómo se desplegaría este sistema para 50 clínicas y 20.000 mensajes al día. Es un diseño: nada de esto está desplegado ni probado en AWS. La base (red, grupos de seguridad, PostgreSQL, la cola de envío, los secretos y los logs) está escrita en Terraform y validada sin desplegar; el resto existe solo en este documento (sección 10). Los precios se consultaron el 4 de octubre de 2026 en las páginas oficiales de cada proveedor, para la región `us-east-1`; los que no se pudieron confirmar en una página oficial están marcados.
 
 ## 1. De qué tamaño es el problema
 
@@ -124,7 +124,7 @@ Cuatro servicios, la misma imagen de contenedor, procesadores ARM:
 
 El relevo de trazas y el envío a WhatsApp son servicios separados aunque usen la misma imagen, porque fallan por causas distintas y no deben arrastrarse: si Atlas se cae, las respuestas se siguen enviando; si Meta se degrada, las trazas siguen llegando a Mongo. También separa los permisos: el relevo de trazas accede a PostgreSQL y a Atlas, y no tiene las credenciales de Meta; el servicio de envío accede a PostgreSQL, SQS y Meta, y no a Atlas.
 
-Dentro del envío, publicar en SQS y consumir de SQS van en el mismo servicio, como dos ciclos independientes, cada uno con su manejo de errores y su espera. Si Meta se degrada, el consumidor reintenta con espera y el publicador sigue encolando respuestas. Si PostgreSQL no responde, se detienen los dos: el publicador no tiene de dónde leer y el consumidor no puede comprobar si un envío ya se hizo. Los mensajes esperan en SQS, y eso es lo correcto: enviar sin esa comprobación sería renunciar a la protección contra duplicados. Separarlos en dos servicios permitiría reducir más los permisos (el publicador no necesita la credencial de Meta ni recibir de la cola; el consumidor no necesita publicar en ella) y escalarlos por separado. A este volumen no compensa otra unidad que operar. Se separarían si la carga, el aislamiento de fallos o el mínimo privilegio lo justificaran; el consumidor también usa PostgreSQL, para comprobar y registrar que un envío ya se hizo.
+Dentro del envío, publicar en SQS y consumir de SQS van en el mismo servicio, como dos ciclos independientes, cada uno con su manejo de errores y su espera. Si Meta se degrada, el consumidor reintenta con espera y el publicador sigue encolando respuestas. Si PostgreSQL no responde, se detienen los dos: el publicador no tiene de dónde leer y el consumidor no puede comprobar si un envío ya se hizo. Los mensajes esperan en SQS mientras el consumidor no los reciba, hasta 4 días, que es lo que la cola los conserva por defecto. Eso es lo correcto: enviar sin esa comprobación reenviaría también las respuestas ya registradas como enviadas. Separarlos en dos servicios permitiría reducir más los permisos (el publicador no necesita la credencial de Meta ni recibir de la cola; el consumidor no necesita publicar en ella) y escalarlos por separado. A este volumen no compensa otra unidad que operar. Se separarían si la carga, el aislamiento de fallos o el mínimo privilegio lo justificaran; el consumidor también usa PostgreSQL, para comprobar y registrar que un envío ya se hizo.
 
 Alternativas descartadas:
 
@@ -140,7 +140,7 @@ En el código actual existen la API, el worker y el relevo de trazas; este últi
 
 El balanceador recibe el webhook de Meta y sirve la interfaz del coordinador. WAF aplica delante un límite de peticiones por IP y las reglas administradas básicas.
 
-Se consideró API Gateway (1 USD por millón de peticiones, frente a unos 22 USD al mes del balanceador). Es más barato, pero para llegar a tareas en subredes privadas necesita un enlace de VPC, y la interfaz necesitaría otro camino. Un solo balanceador para las dos cosas es más simple.
+Se consideró API Gateway (1 USD por millón de peticiones, frente a unos 29 USD al mes del balanceador, contando sus IP públicas). Es más barato, pero para llegar a tareas en subredes privadas necesita un enlace de VPC, y la interfaz necesitaría otro camino. Un solo balanceador para las dos cosas es más simple.
 
 Dos controles que hoy no existen en el código y son obligatorios en producción:
 
@@ -151,7 +151,7 @@ Dos controles que hoy no existen en el código y son obligatorios en producción
 
 Una VPC en dos zonas de disponibilidad con tres niveles de subred: públicas (balanceador y NAT), privadas (tareas) y de datos (RDS, sin ruta a internet). Los grupos de seguridad permiten solo el camino necesario: balanceador a API, tareas a RDS.
 
-Las tareas necesitan salir a internet para llamar a OpenAI y a Meta. Eso exige NAT. Se ponen dos, uno por zona (unos 66 USD al mes), para que la caída de una zona no deje sin salida a las tareas de la otra. Con uno solo se ahorran 33 USD y se acepta que, si cae su zona, el asistente deja de poder llamar al modelo hasta que se recree.
+Las tareas necesitan salir a internet para llamar a OpenAI y a Meta. Eso exige NAT. Se ponen dos, uno por zona (unos 73 USD al mes, con sus IP públicas), para que la caída de una zona no deje sin salida a las tareas de la otra. Con uno solo se ahorran unos 37 USD y se acepta que, si cae su zona, el asistente deja de poder llamar al modelo hasta que se recree.
 
 No se usan puntos de enlace privados para ECR, CloudWatch y Secrets Manager: cada uno cuesta unos 7 USD al mes por zona, más que el tráfico que evitarían por NAT a este volumen. El de S3, que es gratuito, sí.
 
@@ -178,9 +178,16 @@ Hoy la respuesta se guarda y se muestra en la interfaz; no se envía. En producc
 
 1. El cierre del turno deja la respuesta en una tabla de envíos pendientes, en la misma transacción. Es el mismo patrón que ya se usa para las trazas.
 2. Un relevo la publica en una cola SQS FIFO, con la conversación como grupo (conserva el orden por paciente) y el `message_id` como identificador de deduplicación.
-3. Un consumidor llama a la API de Meta. Si falla, SQS reintenta; tras varios fallos, el mensaje pasa a una cola de mensajes fallidos y salta una alarma.
+3. Un consumidor llama a la API de Meta. Si falla, no borra el mensaje: SQS lo vuelve a entregar cuando vence su tiempo de visibilidad.
 
-La deduplicación de SQS no basta como garantía. SQS FIFO solo recuerda el identificador de deduplicación durante 5 minutos: si el relevo publica, muere antes de marcar el envío como publicado y se recupera pasado ese tiempo, el mensaje entra dos veces. Por eso el consumidor necesita su propia idempotencia: antes de llamar a Meta comprueba en PostgreSQL si ese envío ya está registrado como hecho, y lo registra al terminar.
+Con los valores de `infra/terraform` (60 s de visibilidad y 5 entregas como máximo), esto es lo que pasa cuando Meta falla:
+
+- **Reintentos.** SQS vuelve a entregar el mensaje cada vez que vence su visibilidad.
+- **Cola de fallidos.** Tras 5 entregas fallidas, SQS lo pasa a la cola de fallidos, que lo conserva hasta 14 días, y salta una alarma. Con 5 recepciones y 60 s de visibilidad, y si el consumidor reintenta sin pausa, eso ocurre aproximadamente a los 5 minutos de caída de Meta. Desde ahí, las respuestas pendientes quedan en la cola de fallidos y no se reintentan solas.
+- **Recuperación.** Cuando Meta se recupera, se devuelven a la cola de envío con un redrive de la cola de fallidos. La comprobación en PostgreSQL antes de enviar descarta los reintentos de respuestas que ya quedaron registradas como enviadas. No elimina todos los duplicados: si Meta acepta un envío y el consumidor muere antes de registrarlo en PostgreSQL, el reintento lo vuelve a enviar. Por eso la entrega es de al menos una vez.
+- **Orden.** Las respuestas devueltas se intercalan con las nuevas, así que en ese caso no se garantiza el orden dentro de una conversación.
+
+La deduplicación de SQS no basta como garantía. SQS FIFO solo recuerda el identificador de deduplicación durante 5 minutos: si el relevo publica, muere antes de marcar el envío como publicado y se recupera pasado ese tiempo, el mensaje entra dos veces. Por eso el consumidor hace su propia comprobación, que reduce los reenvíos pero no los elimina: antes de llamar a Meta comprueba en PostgreSQL si ese envío ya está registrado como hecho, y lo registra al terminar.
 
 Queda una ventana que no se puede cerrar desde este lado: Meta acepta el mensaje y el consumidor muere antes de registrarlo. En ese caso el paciente puede recibir la respuesta dos veces. Evitarlo exige que el proveedor acepte una clave de idempotencia, y no se ha verificado que la API de Meta la ofrezca. La entrega es de al menos una vez, y se prefiere eso a perder una respuesta.
 
@@ -188,13 +195,13 @@ Aquí SQS sí encaja, y no contradice la decisión de la cola: transporta un men
 
 ### 3.9 Secretos y permisos
 
-Secrets Manager guarda la clave de OpenAI, la credencial de la base (gestionada y rotada por RDS), la cadena de conexión de Atlas y el token y el secreto de Meta. ECS los entrega a cada tarea al arrancar; no están en la imagen ni en variables escritas en el repositorio.
+Secrets Manager guarda la clave de OpenAI, la credencial de la base (gestionada y rotada por RDS), la cadena de conexión de Atlas y el token y el secreto de Meta. ECS los entrega a cada tarea al arrancar; no están en la imagen ni en variables escritas en el repositorio. Para la credencial de la base eso no basta: RDS la rota, y una tarea que la recibió al arrancar se queda con la anterior. Cómo debe consumirla la aplicación está pendiente (sección 9).
 
 Cada servicio tiene su propio rol de IAM con lo mínimo: el worker lee la clave de OpenAI y la credencial de la base; la API no puede leer la clave de OpenAI.
 
 En la base, un rol por proceso: API, worker, ingestión y migraciones. El de ingestión es el único que puede escribir conocimiento. Está previsto en la arquitectura y no está implementado: hoy todo usa un solo usuario.
 
-Cifrado en reposo en RDS, Atlas, SQS y logs; TLS en todas las conexiones.
+Cifrado en reposo en RDS, Atlas, SQS y logs; TLS en todas las conexiones. Hacia RDS, la aplicación todavía no lo usa (sección 9).
 
 ### 3.10 Observabilidad
 
@@ -246,7 +253,7 @@ Escalar por la cola sin límites empeora una caída: más workers son más conex
 | OpenAI con errores o lento | Los intentos fallan y se reintentan; al tercer fallo el paciente recibe la respuesta de respaldo y la conversación pasa a un asesor | Automática |
 | OpenAI rechaza la clave o el modelo (error de configuración) | Hoy: igual que la fila anterior, con una alerta | Pendiente: un interruptor que deja de reclamar mensajes, avisa y los deja en cola, en lugar de escalar cada conversación |
 | Atlas caído | Ninguno para el paciente. Las trazas esperan en PostgreSQL y la interfaz las lee de ahí | El relevo las publica al volver |
-| Meta no acepta envíos | Las respuestas esperan en SQS | Reintentos; cola de fallidos y alarma |
+| Meta no acepta envíos | Cada respuesta se reintenta desde SQS. Si la caída dura más de aproximadamente 5 minutos (5 recepciones con 60 s de visibilidad, con reintentos continuos), las pendientes pasan a la cola de fallidos, que las conserva hasta 14 días (sección 3.8) | Alarma al llegar la primera a la cola de fallidos. Cuando Meta se recupera, se devuelven a la cola de envío con un redrive |
 | Despliegue defectuoso | Las tareas nuevas no pasan la comprobación de salud | ECS conserva las anteriores |
 | Borrado o corrupción de datos | — | Copias automáticas de RDS con recuperación a un punto en el tiempo |
 
@@ -309,15 +316,15 @@ Con este sistema solo se ha ejecutado `gpt-4o-mini`, en conversaciones de prueba
 | RDS PostgreSQL Multi-AZ, `db.m7g.large` | 0,337 por hora | 246 |
 | Almacenamiento y copias de RDS | 50 GB a 0,23, más copias | 14 |
 | Fargate | API 14, workers 43 (3 tareas en promedio), relevo de trazas 7, envío 7 | 72 |
-| Balanceador | 0,0225 por hora más unidades de capacidad | 22 |
-| NAT, dos | 0,045 por hora cada uno, más tráfico | 67 |
+| Balanceador | 0,0225 por hora más unidades de capacidad, y 2 IP públicas a 0,005 por hora cada una | 29 |
+| NAT, dos | 0,045 por hora cada uno, más tráfico, y sus 2 IP públicas a 0,005 por hora cada una | 74 |
 | WAF | Lista, tres reglas y peticiones | 8 |
 | CloudWatch | Logs, 20 métricas, 10 alarmas | 10 |
-| Secrets Manager, ECR, S3, SQS, KMS | | 5 |
-| **AWS** | | **Unos 444** |
+| Secrets Manager, ECR, S3, SQS, SNS, KMS | | 5 |
+| **AWS** | | **Unos 458** |
 | MongoDB Atlas M10 | 0,08 por hora | 58 |
 | Modelo de lenguaje | Según modelo y caché | 190 a 530 |
-| **Total** | | **Unos 690 a 1.030** |
+| **Total** | | **Unos 710 a 1.050** |
 
 Eso es de 14 a 21 USD por clínica al mes, o entre 0,0012 y 0,0017 USD por mensaje.
 
@@ -327,13 +334,47 @@ Qué mueve la cuenta:
 - La base de datos es más de la mitad de AWS. Con un compromiso de un año baja alrededor de un tercio (porcentaje sin confirmar).
 - La infraestructura es casi toda costo fijo: con la mitad de mensajes, la cuenta de AWS casi no baja.
 
-Cifras sin confirmar en página oficial: el precio de NAT se leyó de un ejemplo de otra región de Estados Unidos; el de SQS, de un anuncio antiguo de AWS; que el precio de Atlas M10 incluya los tres nodos; y el precio del emparejamiento de VPC con Atlas. Ninguna cambia el orden de magnitud.
+Cifras sin confirmar en página oficial: el precio de NAT se leyó de un ejemplo de otra región de Estados Unidos; el de SQS, de un anuncio antiguo de AWS; que el precio de Atlas M10 incluya los tres nodos; y el precio del emparejamiento de VPC con Atlas. Ninguna cambia el orden de magnitud. El cargo por IPv4 pública sí se confirmó en la página de precios de VPC el 5 de octubre de 2026: 0,005 USD por dirección y hora, unos 3,65 USD al mes. Se cuentan cuatro: dos de los NAT y dos del balanceador, que usa al menos una por zona y puede usar más con carga.
 
 ## 9. Lo que este diseño no resuelve
 
-- Nada está desplegado. No hay infraestructura como código.
+- Nada está desplegado. La infraestructura como código cubre solo la base (sección 10): los servicios de ECS, el balanceador, WAF, Cognito, Atlas, DNS y certificados no tienen código.
 - No hay integración continua. En producción, cada cambio debe pasar por instalación limpia, comprobación de tipos, tests, `npm audit` y análisis de la imagen antes de construirla. Esta entrega mostró por qué: una dependencia tenía cuatro avisos de severidad alta y solo apareció al ejecutar la auditoría.
 - Los supuestos de carga (duración del turno, forma del pico, tokens por turno) son estimaciones. La primera semana en producción debe medirlos.
 - La transferencia internacional de datos de pacientes necesita validación legal.
 - El interruptor del proveedor, la firma del webhook, la autenticación del coordinador, la seguridad a nivel de fila, los roles de base por proceso, la cuota por clínica y el envío a WhatsApp están diseñados aquí y no implementados.
 - El plan de recuperación ante la pérdida de toda la región no existe: las copias quedan en la misma región.
+- **Dos prerrequisitos de la aplicación antes de un despliegue real.** Hoy no los cumple, y no se resuelven en esta entrega:
+  - **TLS hacia RDS con la autoridad de Amazon RDS.** RDS PostgreSQL 16 rechaza las conexiones sin TLS (`rds.force_ssl` vale 1 por defecto desde la versión 15). Hoy la aplicación conecta con la cadena de `POSTGRES_URL` sin configurar TLS. Es un requisito de seguridad: la aplicación debe conectar con TLS y verificar el servidor, idealmente con el equivalente a `verify-full` (certificado y nombre del servidor), y para eso debe disponer de la autoridad de certificación de Amazon RDS. No se debe desactivar la verificación.
+  - **La contraseña que rota RDS.** RDS rota la del usuario maestro cada 7 días por defecto. Si ECS la entrega como variable de entorno al arrancar, las conexiones ya abiertas siguen funcionando, pero las nuevas fallan desde la rotación hasta que la tarea se reinicia. Hay que decidir cómo la consume la aplicación. Las opciones:
+    - leerla de Secrets Manager y reconectar cuando falla la autenticación;
+    - reiniciar las tareas después de cada rotación;
+    - usar los usuarios por proceso de la sección 3.9, con su propia forma de rotar, en lugar del maestro.
+
+## 10. Infraestructura como código
+
+[`infra/terraform/`](../infra/terraform/) codifica una parte de este diseño. No está desplegada: no se ha ejecutado `terraform plan` ni `apply` contra una cuenta de AWS.
+
+| Codificado | Sección |
+|---|---|
+| VPC en dos zonas, con subredes públicas, de aplicación y de datos; un NAT por zona; las subredes de datos sin ruta a internet; el punto de enlace de S3 | 3.6 |
+| Grupos de seguridad: internet al balanceador por 443, balanceador a la API, tareas a RDS por 5432. RDS no acepta nada más | 3.6 |
+| RDS PostgreSQL 16, instancia Multi-AZ, `db.m7g.large`, 50 GB gp3 cifrados, sin acceso público. La contraseña la genera y la rota RDS en Secrets Manager | 3.2 y 3.9 |
+| Cola SQS FIFO de envío a WhatsApp, su cola de fallidos y una alarma cuando la de fallidos tiene mensajes. La alarma avisa a un tema de SNS que se crea sin suscriptores: quién recibe el aviso se conecta al desplegar | 3.8 |
+| Secretos vacíos para OpenAI, Atlas y Meta; el valor se carga fuera de Terraform | 3.9 |
+| Un grupo de logs por servicio | 3.10 |
+
+Sigue siendo solo diseño: los cuatro servicios de ECS y su autoescalado, el balanceador y sus listeners, WAF, Cognito, ECR, los roles de IAM por servicio, MongoDB Atlas y su emparejamiento de VPC, DNS, certificados, las métricas propias y sus alarmas, el backend remoto del estado y la integración continua.
+
+Al escribirlo hubo que concretar lo que este documento no fija:
+
+- **Un grupo de seguridad aparte para workers, relevo y envío**, sin tráfico de entrada. Solo la API recibe conexiones, y solo del balanceador.
+- **El secreto de Meta son dos:** el de la aplicación, que la API necesita para verificar la firma del webhook, y el token de envío, que solo usa el servicio de envío. Así cada servicio recibe permiso solo sobre el suyo, como pide la sección 3.9.
+- **Valores que el documento no daba:** 7 días de copias de RDS, 30 de logs, 5 entregas fallidas antes de la cola de fallidos y 60 s de visibilidad en la cola. Son variables; están en el README de la carpeta.
+- **Falta el camino hacia Atlas.** Los grupos de la API y de las tareas solo permiten salir por 443 y hacia RDS. Faltan dos cosas, que se agregan junto con el emparejamiento de VPC cuando se conozca el rango de red de Atlas:
+  - la regla de salida al puerto 27017 en esos dos grupos;
+  - las rutas hacia ese rango, por el emparejamiento, en las tablas de rutas de aplicación.
+
+Validación, el 5 de octubre de 2026, con Terraform 1.16.5 (imagen oficial de Docker) y el proveedor `hashicorp/aws` 6.67.0: `fmt -check`, `init -backend=false` y `validate` correctos. `validate` comprueba la sintaxis, los tipos y las referencias contra el esquema del proveedor; no comprueba que AWS acepte cada valor. `plan` no se ejecutó porque necesita credenciales de una cuenta de AWS. Cómo repetir la validación: [`infra/terraform/README.md`](../infra/terraform/README.md).
+
+La sección 8 ya cuenta lo que cuestan estos recursos. Los dos NAT van con sus IP públicas, y RDS con su almacenamiento. Los cinco secretos (los cuatro de la aplicación y el de RDS), las dos colas y el tema de SNS caben en la línea de Secrets Manager, ECR, S3, SQS, SNS y KMS.

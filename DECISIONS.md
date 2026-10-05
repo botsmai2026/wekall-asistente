@@ -8,7 +8,7 @@ Construí un asistente que responde preguntas con base en los documentos de una 
 
 Lo que no hay, dicho de entrada:
 
-- No está desplegado en AWS. El diseño está en `docs/AWS.md`.
+- No está desplegado en AWS. El diseño está en `docs/AWS.md`; su base está escrita en Terraform en `infra/terraform/` y validada sin desplegar (sección 3.13).
 - La respuesta se guarda y se muestra; no se envía a WhatsApp.
 - El webhook y la API no tienen autenticación.
 - El modelo de lenguaje definitivo no está elegido (sección 5).
@@ -22,7 +22,7 @@ Lo que ejecuté yo, en mi equipo, el 4 de octubre de 2026 y con mi clave de Open
 
 Lo que ejecutaron asistentes de IA sobre el repositorio, en mi equipo, y cuyos reportes revisé:
 
-- Los tests de la aplicación: 176 de 176 con PostgreSQL y MongoDB reales. Sin MongoDB se omiten 3 y pasan 173.
+- Los tests de la aplicación: 181 de 181 con PostgreSQL y MongoDB reales. Sin MongoDB se omiten 4 y pasan 177.
 - El verificador de la base de datos: 159 de 159 comprobaciones, con pgvector. La salida está en `verificacion/resultado.txt`.
 - El arranque desde volúmenes vacíos y la prueba con MongoDB detenido: el paciente recibió su respuesta, la traza se pudo leer desde PostgreSQL y pasó a Mongo al volver.
 - La validación final con `gpt-4o-mini`, que repitió los flujos de elección sobre una oferta de horarios y encontró dos fallos que los tests no cubrían (sección 5).
@@ -32,6 +32,19 @@ Lo que ejecutaron asistentes de IA sobre el repositorio, en mi equipo, y cuyos r
 **El código responde por el resultado, no el modelo.** El modelo interpreta lo que dice el paciente y elige una herramienta. El código valida, calcula las fechas, ejecuta contra la base y escribe el texto que recibe el paciente.
 
 Lo elegí porque la prueba pide confiabilidad, y un modelo de lenguaje no la da por sí solo: no sabe qué día es, puede inventar un horario y puede redactar una política que no existe. Cada regla crítica tiene una barrera en código o en la base de datos, no una instrucción en el prompt.
+
+### 2.1 Cómo está organizado el proyecto
+
+| Carpeta | Qué vive ahí |
+|---|---|
+| `src/dominio/` | Reglas puras, sin dependencias: fechas, estados, plantillas de texto, lectura de una selección por número |
+| `src/aplicacion/` | La lógica de negocio: webhook, worker, ciclo del asistente, herramientas (validan y ejecutan), relevo de trazas, ingestión |
+| `src/infraestructura/` | Lo que habla con el exterior: PostgreSQL, MongoDB y OpenAI, más las versiones falsas para los tests |
+| `src/http/` | Rutas y esquemas de la API |
+| `sql/` | Esquema, migraciones y todas las sentencias, con nombre |
+
+- **Dónde está la lógica de negocio:** en `aplicacion/` y `dominio/`, y en las restricciones de la base. Ninguna regla depende del prompt.
+- **Dónde está la integración con el LLM:** en un solo archivo, `infraestructura/openai.ts`. La aplicación solo conoce una interfaz (`ModeloLenguaje`, en `aplicacion/puertos.ts`); no importa el SDK del proveedor.
 
 ## 3. Decisiones
 
@@ -48,6 +61,15 @@ Además de las cuatro herramientas pedidas hay una quinta, `responder`. El model
 PostgreSQL dice qué es cierto ahora: conversaciones, mensajes, agenda, citas, conocimiento y la respuesta que recibió el paciente. Necesita transacciones y restricciones: un horario con una sola cita activa, una cita por mensaje, un estado que solo sube.
 
 MongoDB dice qué ocurrió y cuánto costó: una traza por intento, con modelo, tokens, latencia y cada herramienta con sus argumentos y resultados. Es un documento anidado de forma variable, que solo se inserta y crece rápido.
+
+Entidades en PostgreSQL (12 tablas; el detalle, con sus restricciones, está en la sección 3 de `docs/ARQUITECTURA.md`):
+
+- **Agenda:** clínica → sedes y especialidades → profesionales → horarios (`slots`) → citas.
+- **Conversación:** clínica → conversaciones (una por teléfono) → mensajes entrantes, cada uno con su respuesta. Una cita apunta al mensaje que la originó.
+- **Conocimiento:** documentos → líneas → fragmentos con su vector.
+- **Trazas pendientes** de copiar a Mongo.
+
+En MongoDB hay una colección, `trazas_intento`: un documento por intento.
 
 - **Por qué así.** Ninguna operación necesita que Mongo responda para ser correcta. Si Mongo se cae, el paciente no lo nota.
 - **Lo digo sin adornos:** con este volumen, una columna JSON en PostgreSQL bastaría. Mongo es un requisito de la prueba y le di el papel donde mejor encaja.
@@ -184,17 +206,53 @@ Resumen; el detalle y los precios están en `docs/AWS.md`.
 
 La regla que seguí: la complejidad debe ser proporcional al problema. A 20.000 mensajes al día, casi todas las decisiones eligen la opción más simple que cumple.
 
+En `docs/AWS.md` están el diagrama (sección 2), los servicios con las alternativas descartadas (3), cómo escala (4), qué pasa si cae una pieza (5), cómo se separan los datos de cada clínica (6) y el costo mensual (8).
+
+**Infraestructura como código.** El enunciado la cuenta como un extra. La base del diseño está en Terraform, en `infra/terraform/`:
+- la red en dos zonas, con un NAT por zona;
+- los grupos de seguridad;
+- RDS PostgreSQL Multi-AZ;
+- la cola SQS FIFO de envío, con su cola de fallidos y una alarma;
+- los secretos, vacíos;
+- los grupos de logs.
+
+Pasó `terraform fmt`, `init` y `validate`; no se ha ejecutado `plan` ni `apply` contra una cuenta de AWS. Lo demás (ECS, balanceador, WAF, Cognito, Atlas) sigue siendo diseño. El detalle, y lo que hubo que concretar al escribirlo, está en la sección 10 de `docs/AWS.md`.
+
+### 3.14 Pipeline de IA
+
+- **Cómo se parten los documentos.** Cada documento es Markdown con un título, secciones y un dato por línea. Un fragmento es una sección; si pasa de 1.500 caracteres se divide, repitiendo una línea entre partes. Cada línea tiene un máximo de 500 caracteres. Elegí la sección como unidad de búsqueda y la línea como unidad de respuesta: así se puede contestar con texto literal.
+- **Embeddings.** `text-embedding-3-small`, de 1.536 dimensiones. Cada fragmento guarda con qué modelo se calculó, y cambiar de modelo obliga a recalcular.
+- **Búsqueda.** Distancia coseno exacta en pgvector, filtrada por clínica; se entregan al modelo los 4 fragmentos más cercanos que superen el umbral (sección 3.8).
+- **Cómo se arma el prompt.** Primero las reglas fijas, luego las sedes y especialidades reales de la clínica, y al final la fecha y hora del mensaje: lo que no cambia va primero para aprovechar la caché del proveedor. El historial son los últimos 10 turnos, solo texto. El texto del paciente va delimitado y en su propio rol, nunca en el mensaje de sistema.
+- **Cómo se controla el ciclo de herramientas.** Una herramienta por llamada, siempre obligatoria. Máximo 5 iteraciones, 60 s por intento, 20 s por llamada al modelo, 400 tokens de salida y un tope al tamaño de la entrada. Cada llamada se valida dos veces, contra el esquema y contra la base; un error vuelve al modelo como resultado para que corrija o pregunte. El ciclo solo termina con `responder` o `escalar_a_humano` aceptados por el código.
+
+### 3.15 Ambigüedades del enunciado y cómo las resolví
+
+- **Qué hora manda.** La hora del mensaje define qué día es "hoy" y "mañana"; el reloj del servidor decide si una fecha ya pasó. Consecuencia: el ejemplo literal del enunciado, enviado después del 6 de octubre de 2026, pide una fecha pasada y el asistente solicita otra. El caso está cubierto por un test con reloj fijo.
+- **`consultar_disponibilidad(especialidad, sede, fecha)`.** La sede es opcional, porque el paciente no siempre la dice, y agregué una franja opcional (mañana o tarde) para "mañana en la tarde".
+- **`agendar_cita(...)`.** El enunciado deja abiertos los argumentos. Decidí que el modelo no identifique el horario: indica la posición que eligió el paciente y el código la resuelve (sección 3.6).
+- **Estados.** Además de los tres del enunciado hay `en_curso`, para una conversación que todavía no tiene resultado.
+- **"Cuánto costó".** Por turno se muestran modelo, tokens de entrada y de salida, y cuántos se leyeron de caché. No se muestra un valor en dinero: depende de un precio que cambia, y se calcula a partir de esos datos.
+- **Escalar a un humano.** La conversación queda marcada con su motivo y el paciente recibe un aviso. No hay bandeja de asesor: desde ahí el asistente solo responde que un asesor continuará.
+
 ## 4. Costo
 
-Estimación para 50 clínicas y 600.000 mensajes al mes: entre 690 y 1.030 USD mensuales (14 a 21 USD por clínica). AWS son unos 444, Atlas 58 y el modelo entre 190 y 530.
+Estimación para 50 clínicas y 600.000 mensajes al mes: entre unos 710 y 1.050 USD mensuales (14 a 21 USD por clínica). AWS son unos 458, incluidas las IP públicas de los NAT y del balanceador; Atlas, 58, y el modelo, entre 190 y 530.
 
-**Escenario de referencia para costos.** Para estimar usé una conversación de 4 mensajes del paciente, 9 llamadas al modelo, unos 22.000 tokens de entrada y 400 de salida. Es un supuesto de cálculo, no una estadística de uso real. Con él, una conversación cuesta entre 0,0013 y 0,0035 USD, según el modelo y cuánto se aproveche la caché de entrada. Son precios del nivel de procesamiento estándar.
+**Escenario de referencia para costos.** La estimación parte de una conversación de 4 mensajes del paciente, 9 llamadas al modelo, unos 22.000 tokens de entrada y 400 de salida. Es un supuesto de cálculo, no una estadística de uso real. Con él, una conversación cuesta entre 0,0013 y 0,0035 USD, según el modelo y cuánto se aproveche la caché de entrada. Son precios del nivel de procesamiento estándar.
 
 **Mediciones reales.** Estas cifras sí salen del consumo que reporta el proveedor en cada llamada (`usage`), guardado en las trazas. Una conversación de 4 mensajes con `gpt-4o-mini`, el 4 de octubre de 2026: 16.252 tokens de entrada, de los cuales el 61 % se leyó de caché, 269 de salida, entre 2,4 y 5,2 s por turno, y un costo de unos 0,0019 USD. En la validación final, 22 turnos de 8 conversaciones cortas con el mismo modelo sumaron 79.062 tokens de entrada (60 % de caché) y 1.264 de salida, con turnos de 0,8 a 4,1 s. Quedan por debajo del escenario de referencia, pero la muestra es demasiado pequeña para reemplazar los supuestos de dimensionamiento: los orienta.
 
 Qué tan firme es la estimación mensual: los precios se consultaron el 4 de octubre de 2026; los tokens del escenario de referencia salen del tamaño medido del prompt con una conversión aproximada, no de llamadas reales; la duración del turno y la forma del pico son supuestos. Las mediciones reales de arriba no entraron en ese cálculo.
 
 La infraestructura es casi toda costo fijo. El modelo es el costo que crece con el uso.
+
+**Cómo lo reduciría.** Casi todo el costo de una conversación son tokens de entrada que se repiten en cada llamada. En orden de efecto esperado:
+
+1. Mantener estable el comienzo del prompt para que el proveedor lo cobre como caché. Ya está hecho; en las pruebas se leyó de caché cerca del 60 % de la entrada.
+2. Menos llamadas por turno: que el código cierre el turno cuando el resultado ya está determinado, como ya hace al volver a ofrecer horarios.
+3. Historial más corto: ofertas de horarios más compactas y menos turnos de contexto.
+4. Un modelo más barato, solo después de medirlo con un conjunto de conversaciones de evaluación.
 
 ## 5. El modelo de lenguaje
 
@@ -226,6 +284,14 @@ Un fallo del código que el modelo real destapó, en una conversación de seis c
 - **Corrección.** El código acepta ahora el día con tilde o con mayúsculas y lo normaliza antes de validar, con un test que antes fallaba.
 - **Límite que permanece.** Cuando el modelo cuenta días, el código no puede saber si contó bien (sección 3.7). El arreglo quita el motivo que lo llevó a contar en este caso, no el límite.
 
+Un límite observado, que no es un fallo de corrección: «la de las 8». Pasó el 5 de octubre, después de una oferta de ocho horarios de medicina general, dos de ellos a las 8:00:
+
+- **Lo que hizo el modelo.** En 3 de 3 conversaciones, ante «la de las 8», llamó a `agendar_cita` con `opcion: 1` en lugar de usar `atributos`, que es lo que pide el prompt para una referencia por hora.
+- **Lo que hizo el código.** Rechazó esa autorización porque el mensaje no contiene una posición, y no se creó ninguna cita. El turno terminó con la oferta otra vez numerada: los mismos ocho horarios, porque seguían libres, guardados como oferta nueva. No se redujo a los dos de las 8:00: eso solo ocurre cuando el modelo usa `atributos`.
+- **La selección siguiente.** En la conversación que continuó, «1» reservó exactamente el horario de la posición 1 de esa oferta nueva, comprobado en PostgreSQL.
+- **Qué cuesta.** Un turno más para el paciente, no una reserva equivocada.
+- **Qué no demuestra.** Solo se probó esta frase, con un modelo y en tres conversaciones. No se sabe cómo se comporta con referencias por sede o por profesional, ni si con otro modelo usaría `atributos`.
+
 ## 6. Uso de IA
 
 Usé IA durante todo el proyecto, y creo que lo relevante es cómo.
@@ -248,6 +314,8 @@ Usé IA durante todo el proyecto, y creo que lo relevante es cómo.
 
 **Lo que solo apareció al ejecutar con el modelo real.** En la primera conversación de prueba, ante "El primero", el modelo intentó agendar una etiqueta de un mensaje anterior. El código la rechazó, como estaba previsto, pero el modelo volvió a consultar y agendó el primero de la lista nueva. Funcionó por casualidad: con otro paciente reservando entre los dos mensajes, habría agendado una hora distinta de la que el paciente eligió. Ninguna de las rondas de revisión lo había visto. La primera corrección propuesta fue ajustar el prompt; la descarté porque dejaba la garantía en manos del modelo. La segunda guardaba la oferta y resolvía la opción en el código, y pasó todos los tests. Una revisión adversarial con otra herramienta mostró que seguía incompleta: después del rechazo, el modelo todavía podía agendar otra opción o un horario de una consulta nueva dentro del mismo mensaje. La versión final cierra el turno para agendar en cuanto la elección falla, y tiene tests que reproducen las dos formas de saltársela. Quedaba un tercer caso: «la de las 8» con dos horarios a las 8:00. La búsqueda por atributos evitaba elegir si había dos coincidencias, pero la revisión reprodujo otras vías: una etiqueta H podía elegir sede sin autorización, `opcion` podía contradecir el mensaje, y un atributo añadido por el modelo podía hacer única la coincidencia. La autorización ahora se extrae determinísticamente del mensaje completo y debe coincidir con `opcion`. Las etiquetas H no crean citas; los atributos solo producen ofertas persistidas, incluso con una sola coincidencia. Esto sacrifica la reserva inmediata por hora/profesional y exige una elección posicional posterior. Una revisión posterior encontró otro caso: tras una oferta, el paciente dice «mejor otro día», el asistente pregunta la fecha y el paciente contesta «el 5». El texto es una posición válida, y si el modelo lo tomaba como la opción 5 se creaba la cita. Ahora una posición solo vale mientras el asistente espera la elección de esa oferta, y eso se deduce de los tipos de respuesta ya guardados: una pregunta al paciente la anula; una respuesta documental no. Y la validación final con el modelo real, que repitió esos flujos, encontró dos fallos más que ningún test cubría: uno del prompt y otro del código (sección 5). Lo que aprendí: una suite en verde solo prueba lo que cubre.
 
+**Lo que encontré al levantar el proyecto por segunda vez.** La interfaz mostraba "Mongo no responde" con MongoDB sano. La API había usado Mongo unos segundos antes de que estuviera listo, y el cliente del driver, tras fallar su primera conexión, queda cerrado y no vuelve a intentar. Lo reproduje apagando Mongo, arrancando la API y encendiéndolo de nuevo: seguía sin recuperarse. Ahora el adaptador descarta ese cliente y abre otro, con un test que fallaba antes. Ni los tests ni las revisiones lo habían visto: todos probaban el caso contrario, Mongo caído después de conectar.
+
 **Dónde decidí contra una recomendación de la IA.**
 
 - Pedí comparar Zod y TypeBox antes de aceptar la propuesta inicial, y elegí TypeBox (sección 3.12).
@@ -264,4 +332,6 @@ Con más tiempo, en este orden:
 2. El interruptor del proveedor, para que un error de configuración no se pague conversación por conversación.
 3. Verificación de la firma del webhook y autenticación del coordinador.
 4. Seguridad a nivel de fila en PostgreSQL, para que el aislamiento entre clínicas no dependa de que cada consulta filtre.
-5. El envío real a WhatsApp, con su propia idempotencia.
+5. El envío real a WhatsApp, con control de reintentos, deduplicación best-effort y semántica at-least-once documentada.
+
+La observabilidad y la operación con varias clínicas en producción están diseñadas en `docs/AWS.md`, secciones 3.10 y 6.

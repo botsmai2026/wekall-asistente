@@ -59,7 +59,7 @@ export function definirHerramientas(contexto: ContextoIntento): DefinicionHerram
     },
     {
       nombre: 'consultar_disponibilidad',
-      descripcion: 'Consulta los horarios libres de una especialidad en una fecha. Devuelve la fecha consultada y horarios con etiquetas H1, H2…',
+      descripcion: 'Consulta los horarios libres de una especialidad en una fecha. Si el paciente dijo "en la mañana" o "en la tarde", envíalo en "franja" (manana = antes del mediodía, tarde = desde el mediodía); sin franja se consulta todo el día. Devuelve la fecha consultada y horarios con etiquetas H1, H2…',
       esquema: Type.Object(
         {
           especialidad: unoDe(contexto.especialidades.map((e) => e.nombre)),
@@ -270,7 +270,7 @@ async function consultarDisponibilidad(
     return { etiqueta, hora: escribirHora(fila.inicia_en, contexto.zona), profesional: fila.profesional, sede: nombreSede };
   });
   if (memoria.eleccionFallida) memoria.eleccionFallida.consultoDespues = true;
-  memoria.ultimaConsulta = { especialidad: especialidad.nombre, sede: sede?.nombre ?? null, fecha, vacia: horarios.length === 0 };
+  memoria.ultimaConsulta = { especialidad: especialidad.nombre, sede: sede?.nombre ?? null, fecha, franja: a.franja ?? null, vacia: horarios.length === 0 };
 
   return {
     resultado: { fecha_consultada: escribirFecha(fecha), especialidad: especialidad.nombre, horarios },
@@ -474,7 +474,7 @@ async function resolverPorAtributos(
   return {
     fin: {
       tipo: 'oferta_horarios',
-      texto: plantillas.aclararHorario(coinciden.map((o, i) => ({ ...o, numero: i + 1 })), contexto.zona),
+      texto: plantillas.aclararHorario(coinciden[0]!.especialidad, coinciden, contexto.zona),
       ofertaSlots: coinciden.map((o) => o.slotId),
     },
     real: { resultado: 'oferta_por_atributos', atributos, slots: coinciden.map((o) => o.slotId) },
@@ -560,7 +560,7 @@ async function responder(
     case 'sin_disponibilidad': {
       const consulta = memoria.ultimaConsulta;
       if (!consulta || !consulta.vacia) return error('respuesta_no_permitida', 'sin_disponibilidad solo es válida si la última consulta de disponibilidad de este turno no devolvió horarios.');
-      return { fin: { tipo: 'sin_disponibilidad', texto: plantillas.sinDisponibilidad(consulta.especialidad, consulta.fecha, consulta.sede, contexto.zona, memoria.eleccionFallida?.hora ?? null) } };
+      return { fin: { tipo: 'sin_disponibilidad', texto: plantillas.sinDisponibilidad(consulta.especialidad, consulta.fecha, consulta.sede, contexto.zona, memoria.eleccionFallida?.hora ?? null, consulta.franja) } };
     }
     case 'confirmacion_cita': {
       if (!memoria.citaCreada) return error('respuesta_no_permitida', 'No se ha agendado ninguna cita en este turno. Usa agendar_cita primero.');

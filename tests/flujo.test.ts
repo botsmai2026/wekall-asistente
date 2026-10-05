@@ -113,7 +113,7 @@ describe('agendamiento', () => {
     await procesarUno(deps);
     const oferta = await mensaje('m1');
     expect(oferta.respuesta_tipo).toBe('oferta_horarios');
-    expect(oferta.respuesta_texto).toContain('1. martes 6 de octubre de 2026, 8:00 a. m., con Dra. Laura Mejía, sede Norte');
+    expect(oferta.respuesta_texto.split('\n').slice(0, 2)).toEqual(['Horarios de Medicina general para el martes 6 de octubre de 2026, con Dra. Laura Mejía, sede Norte:', '1. 8:00 a. m.']);
     expect((await conversacion()).estado).toBe('en_curso'); // ofrecer horarios no cambia el estado
 
     await e.enviar('El primero', 'm2');
@@ -188,6 +188,35 @@ describe('agendamiento', () => {
     await e.enviar('medicina general mañana', 'm2');
     await procesarUno(e.con(consultarManana, responder({ tipo: 'sin_disponibilidad' }), responder({ tipo: 'oferta_horarios', horarios: ['H1'] })));
     expect((await trazas('m2'))[0].llamadas[1].resultado.error).toBe('respuesta_no_permitida');
+  });
+
+  it('"mañana en la tarde" consulta desde el mediodía; sin horarios en esa franja, el texto no habla de todo el día', async () => {
+    const dermatologia = (fecha: object, franja?: string): Paso => ({ herramienta: 'consultar_disponibilidad', argumentos: { especialidad: 'Dermatología', fecha, ...(franja ? { franja } : {}) } });
+    await e.enviar('Hola, ¿tienen cita con dermatología mañana en la tarde?', 'm1'); // el mensaje del enunciado
+    await procesarUno(e.con(dermatologia({ dias_desde_hoy: 1 }, 'tarde'), (mensajes) => responder({ tipo: 'oferta_horarios', horarios: ultimoResultado(mensajes).horarios.map((h: any) => h.etiqueta) })));
+    // Lo que pidió el modelo y lo que consultó el código: el día siguiente en Colombia, desde el mediodía.
+    const consulta = (await trazas('m1'))[0].llamadas[0];
+    expect(consulta.argumentos.franja).toBe('tarde');
+    expect(consulta.real.fecha).toEqual({ anio: 2026, mes: 10, dia: 6 });
+    expect(consulta.real.desde).toBe('2026-10-06T17:00:00.000Z'); // 12:00 m. del martes 6 en Colombia
+    expect(consulta.real.hasta).toBe('2026-10-07T05:00:00.000Z');
+    // Ningún horario ofrecido empieza antes del mediodía.
+    const ofrecidos = (await mensaje('m1')).oferta_slots;
+    const { rows: inicios } = await base.pool.query('SELECT inicia_en FROM slots WHERE id = ANY($1::bigint[])', [ofrecidos]);
+    expect(inicios).toHaveLength(6);
+    expect(inicios.every((f) => f.inicia_en >= new Date('2026-10-06T17:00:00Z') && f.inicia_en < new Date('2026-10-07T05:00:00Z'))).toBe(true);
+    const oferta = (await mensaje('m1')).respuesta_texto.split('\n');
+    expect(oferta.slice(0, 2)).toEqual(['Horarios de Dermatología para el martes 6 de octubre de 2026, con Dra. Camila Torres, sede Norte:', '1. 2:00 p. m.']);
+    expect(oferta.at(-1)).toBe('Responda con el número de la opción que prefiere.');
+    expect(oferta.some((linea: string) => linea.includes('a. m.'))).toBe(false);
+
+    // El sábado solo se atiende en la mañana.
+    await e.enviar('¿y el sábado en la tarde?', 'm2');
+    await procesarUno(e.con(dermatologia({ dia_semana: 'sabado' }, 'tarde'), responder({ tipo: 'sin_disponibilidad' })));
+    expect((await mensaje('m2')).respuesta_texto).toBe('No hay horarios disponibles de Dermatología para el sábado 10 de octubre de 2026 en la tarde. Si lo desea, puedo buscar en otro momento del día o en otra fecha.');
+    await e.enviar('¿y en la mañana?', 'm3');
+    await procesarUno(e.con(dermatologia({ dia_semana: 'sabado' }, 'manana'), (mensajes) => responder({ tipo: 'oferta_horarios', horarios: [ultimoResultado(mensajes).horarios[0].etiqueta] })));
+    expect((await mensaje('m3')).respuesta_texto.split('\n').slice(0, 2)).toEqual(['Horarios de Dermatología para el sábado 10 de octubre de 2026, con Dra. Camila Torres, sede Norte:', '1. 8:00 a. m.']);
   });
 
   it('dos pacientes piden el mismo horario a la vez: solo uno lo obtiene', async () => {
@@ -530,8 +559,12 @@ describe('etiquetas de horario y reingestión', () => {
     }));
     expect(primeraDelMiercoles).toBe('H9'); // la numeración continúa: H1 nunca nombra dos horarios distintos
     const texto = (await mensaje('m1')).respuesta_texto;
-    expect(texto).toContain('1. martes 6 de octubre de 2026, 8:00 a. m.');
-    expect(texto).toContain('2. miércoles 7 de octubre de 2026, 8:00 a. m.');
+    // La fecha cambia entre opciones: se queda en cada línea. El profesional y la sede son comunes: suben al encabezado.
+    expect(texto.split('\n').slice(0, 3)).toEqual([
+      'Horarios de Medicina general, con Dra. Laura Mejía, sede Norte:',
+      '1. martes 6 de octubre de 2026, 8:00 a. m.',
+      '2. miércoles 7 de octubre de 2026, 8:00 a. m.',
+    ]);
   });
 
   it('si el documento se reingiere entre la búsqueda y la respuesta, las líneas viejas se rechazan y el modelo vuelve a buscar', async () => {
@@ -612,7 +645,7 @@ describe('el paciente elige de la lista que ya recibió', () => {
     const respuesta = await mensaje('a2');
     expect(respuesta.respuesta_tipo).toBe('oferta_horarios');
     expect(respuesta.respuesta_texto.split('\n')[0]).toBe('El horario de las 8:00 a. m. del martes 6 de octubre de 2026 que eligió ya no está disponible.');
-    expect(respuesta.respuesta_texto).toContain('1. martes 6 de octubre de 2026, 8:30 a. m.');
+    expect(respuesta.respuesta_texto.split('\n').slice(1, 3)).toEqual(['Horarios de Medicina general para el martes 6 de octubre de 2026, con Dra. Laura Mejía, sede Norte:', '1. 8:30 a. m.']);
     // La única cita es la de B: A no quedó con las 8:30 sin haberlas elegido.
     const todas = await citas();
     expect(todas.map((c) => c.source_message_id)).toEqual(['b1']);
@@ -661,7 +694,7 @@ describe('el paciente describe el horario en vez de dar su número', () => {
 
   it('una oferta con dos opciones a la misma hora pide el número', async () => {
     await ofrecer();
-    expect((await mensaje('m1')).respuesta_texto.split('\n').at(-1)).toBe('Indíqueme el número de la opción que prefiere y la agendo.');
+    expect((await mensaje('m1')).respuesta_texto.split('\n').at(-1)).toBe('Responda con el número de la opción que prefiere.');
   });
 
   it('"la de las 8" con dos horarios a las 8: no se agenda y se le pregunta cuál, sin volver al modelo', async () => {
@@ -674,7 +707,9 @@ describe('el paciente describe el horario en vez de dar su número', () => {
     const respuesta = await mensaje('m2');
     expect(respuesta.respuesta_tipo).toBe('oferta_horarios');
     const lineas = respuesta.respuesta_texto.split('\n');
-    expect(lineas[0]).toBe('Estos son los horarios que coinciden con la búsqueda:');
+    // La fecha es común y sube al encabezado; profesional y sede cambian y se quedan en cada línea.
+    expect(lineas[0]).toBe('Horarios de Medicina general que coinciden con su búsqueda para el martes 6 de octubre de 2026:');
+    expect(lineas.slice(1, 3).every((l: string) => /^\d\. 8:00 a\. m\., con .+, sede (Norte|Sur)$/.test(l))).toBe(true);
     expect(lineas.slice(1, 3).map((l: string) => l.slice(0, 2)).sort()).toEqual(['1.', '2.']);
     expect(lineas.slice(1, 3).every((l: string) => l.includes('8:00 a. m.'))).toBe(true);
     const llamada = (await trazas('m2'))[0].llamadas[0];
@@ -1215,7 +1250,7 @@ describe('cuando el paciente no da un número, se vuelve a ofrecer con la dispon
     expect(reoferta.respuesta_tipo).toBe('oferta_horarios');
     expect(reoferta.oferta_slots.map(Number)).toEqual([original[1], original[2]]);
     expect(reoferta.respuesta_texto).not.toContain('8:00 a. m.');
-    expect(reoferta.respuesta_texto).toContain('1. martes 6 de octubre de 2026, 8:30 a. m.');
+    expect(reoferta.respuesta_texto.split('\n').slice(0, 3)).toEqual(['Para agendar necesito el número de la opción.', 'Horarios de Medicina general para el martes 6 de octubre de 2026, con Dra. Laura Mejía, sede Norte:', '1. 8:30 a. m.']);
     expect((await trazas('a2'))[0].llamadas[0].real.retirados).toEqual([original[0]]);
 
     // "1" ahora es las 8:30: se resuelve contra la lista que A acaba de leer, no contra la primera.
@@ -1235,7 +1270,7 @@ describe('cuando el paciente no da un número, se vuelve a ofrecer con la dispon
     await e.enviar('ese', 'a2', A);
     await procesarUno(e.con(agendar(1), consultarManana, ofrecerTres));
     expect((await trazas('a2'))[0].llamadas[0].resultado.error).toBe('oferta_no_vigente');
-    expect((await mensaje('a2')).respuesta_texto).toContain('1. martes 6 de octubre de 2026, 8:30 a. m.');
+    expect((await mensaje('a2')).respuesta_texto).toContain('\n1. 8:30 a. m.\n');
     expect((await citas()).map((c) => c.source_message_id)).toEqual(['b1']);
   });
 
@@ -1251,5 +1286,63 @@ describe('cuando el paciente no da un número, se vuelve a ofrecer con la dispon
     await e.enviar('la 3', 'm3');
     await procesarUno(e.con(agendar(3), confirmar));
     expect(await citas()).toHaveLength(1);
+  });
+});
+
+describe('el número que lee el paciente es la posición guardada', () => {
+  // Reconstruye, a partir del texto que recibió el paciente y de los datos de la base,
+  // a qué horario corresponde cada número, y lo compara con oferta_slots.
+  const comprobar = async (messageId: string) => {
+    const m = await mensaje(messageId);
+    const guardados: number[] = m.oferta_slots.map(Number);
+    const lineas: string[] = m.respuesta_texto.split('\n');
+    const opciones = lineas.filter((l) => /^\d+\. /.test(l));
+    // Una línea numerada por horario, numeradas 1..N en orden.
+    expect(opciones.map((l) => Number(l.split('.')[0]))).toEqual(guardados.map((_, i) => i + 1));
+    const { rows } = await base.pool.query(
+      `SELECT s.id, s.inicia_en, p.nombre AS profesional, se.nombre AS sede
+       FROM slots s JOIN profesionales p ON p.id = s.profesional_id JOIN sedes se ON se.id = p.sede_id WHERE s.id = ANY($1::bigint[])`, [guardados]);
+    const encabezado = lineas.find((l) => l.startsWith('Horarios de '))!;
+    guardados.forEach((slotId, i) => {
+      const slot = rows.find((r) => Number(r.id) === slotId)!;
+      const hora = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Bogota', hour: 'numeric', minute: '2-digit', hour12: true }).format(slot.inicia_en).replace(' AM', ' a. m.').replace(' PM', ' p. m.');
+      const visible = `${encabezado} ${opciones[i]}`; // lo común está en el encabezado; lo que cambia, en la línea
+      expect(opciones[i]).toContain(`${i + 1}. `);
+      expect(opciones[i]).toContain(hora);
+      expect(visible).toContain(`con ${slot.profesional}`);
+      expect(visible).toContain(`sede ${slot.sede}`);
+    });
+    return { guardados, opciones, encabezado };
+  };
+
+  it('oferta homogénea: fecha, profesional y sede en el encabezado; cada línea, solo la hora', async () => {
+    await e.enviar('medicina general mañana en la Norte', 'm1');
+    await procesarUno(e.con(consultarManana, (mensajes) => responder({ tipo: 'oferta_horarios', horarios: ultimoResultado(mensajes).horarios.slice(0, 4).map((h: any) => h.etiqueta) })));
+    const { opciones, encabezado, guardados } = await comprobar('m1');
+    expect(encabezado).toBe('Horarios de Medicina general para el martes 6 de octubre de 2026, con Dra. Laura Mejía, sede Norte:');
+    expect(opciones).toEqual(['1. 8:00 a. m.', '2. 8:30 a. m.', '3. 9:00 a. m.', '4. 9:30 a. m.']);
+    // La opción 3 del texto reserva el tercer horario guardado.
+    await e.enviar('3', 'm2');
+    await procesarUno(e.con(agendar(3), confirmar));
+    expect((await citas()).map((c) => Number(c.slot_id))).toEqual([guardados[2]]);
+    expect((await mensaje('m2')).respuesta_texto).toContain('a las 9:00 a. m.');
+  });
+
+  it('oferta con dos sedes: lo que cambia se queda en la línea, y aunque el modelo entregue las etiquetas desordenadas el texto y lo guardado coinciden', async () => {
+    await e.enviar('medicina general mañana', 'm1');
+    await procesarUno(e.con(
+      { herramienta: 'consultar_disponibilidad', argumentos: { especialidad: 'Medicina general', fecha: { dias_desde_hoy: 1 } } },
+      (mensajes) => responder({ tipo: 'oferta_horarios', horarios: ultimoResultado(mensajes).horarios.slice(0, 4).map((h: any) => h.etiqueta).reverse() }),
+    ));
+    const { opciones, encabezado, guardados } = await comprobar('m1');
+    expect(encabezado).toBe('Horarios de Medicina general para el martes 6 de octubre de 2026:');
+    expect(opciones.every((l) => /^\d\. \d+:\d\d a\. m\., con .+, sede (Norte|Sur)$/.test(l))).toBe(true);
+    // La opción 2 del texto reserva el segundo horario guardado, con el profesional y la sede que decía esa línea.
+    await e.enviar('2', 'm2');
+    await procesarUno(e.con(agendar(2), confirmar));
+    const [cita] = await citas();
+    expect(Number(cita.slot_id)).toBe(guardados[1]);
+    const sedeDeLaLinea = opciones[1]!.includes('sede Sur') ? 'Sur' : 'Norte';
+    expect((await mensaje('m2')).respuesta_texto).toContain(`en la sede ${sedeDeLaLinea}`);
   });
 });

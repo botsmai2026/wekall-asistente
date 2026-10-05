@@ -1,6 +1,7 @@
 // Prueba del almacén de trazas contra un MongoDB REAL. Solo corre si se indica
 // dónde está:  MONGO_URL_PRUEBAS=mongodb://localhost:27017 npm test
 // Sin esa variable se omite, para que "npm test" no dependa de tener Mongo.
+import { createServer, connect, type AddressInfo, type Server } from 'node:net';
 import { afterAll, describe, expect, it } from 'vitest';
 import { AlmacenTrazasMongo } from '../src/infraestructura/mongo.js';
 import { ErrorInfraestructura } from '../src/dominio/errores.js';
@@ -39,4 +40,51 @@ describe('almacén de trazas con Mongo inalcanzable', () => {
     expect(await almacen.disponible()).toBe(false);
     await almacen.cerrar();
   });
+});
+
+// Si la PRIMERA conexión de un cliente del driver falla, ese cliente queda cerrado
+// y sus operaciones siguientes fallan al instante sin volver a intentar. Pasó al
+// arrancar la API antes que Mongo: no volvió a leer trazas hasta reiniciarla.
+describe('Mongo no estaba listo en el primer uso', () => {
+  /** Un puerto local libre: se abre un servidor, se anota su puerto y se cierra. */
+  const puertoLibre = () => new Promise<number>((resolver) => {
+    const s = createServer().listen(0, '127.0.0.1', () => { const { port } = s.address() as AddressInfo; s.close(() => resolver(port)); });
+  });
+  const escuchar = (servidor: Server, puerto: number) => new Promise<void>((resolver) => servidor.listen(puerto, '127.0.0.1', resolver));
+
+  it('después de un primer fallo, la siguiente operación vuelve a intentar conectarse', async () => {
+    const puerto = await puertoLibre();
+    const almacen = AlmacenTrazasMongo.crear(`mongodb://127.0.0.1:${puerto}`, 'nada');
+    expect(await almacen.disponible()).toBe(false); // nadie escucha todavía
+
+    // Ahora sí hay alguien en ese puerto. No es Mongo: solo cuenta si le llegan conexiones.
+    let conexiones = 0;
+    const servidor = createServer((socket) => { conexiones += 1; socket.destroy(); });
+    await escuchar(servidor, puerto);
+    await almacen.disponible();
+    expect(conexiones).toBeGreaterThan(0); // con el cliente cerrado del driver no llegaría ninguna
+    await almacen.cerrar();
+    await new Promise((resolver) => servidor.close(resolver));
+  }, 15_000);
+
+  it.skipIf(!url)('y si Mongo ya está arriba, se recupera sin reiniciar el proceso', async () => {
+    // "Mongo caído y luego arriba" se simula con un puente TCP hacia el Mongo real que al principio no existe.
+    const destino = new URL(url!);
+    const puerto = await puertoLibre();
+    const almacen = AlmacenTrazasMongo.crear(`mongodb://127.0.0.1:${puerto}/?directConnection=true`, `pruebas_${Date.now()}`);
+    expect(await almacen.disponible()).toBe(false);
+
+    const puente = createServer((entrada) => {
+      const salida = connect(Number(destino.port || 27017), destino.hostname);
+      entrada.pipe(salida).pipe(entrada);
+      const cortar = () => { entrada.destroy(); salida.destroy(); };
+      entrada.on('error', cortar); salida.on('error', cortar);
+    });
+    await escuchar(puente, puerto);
+    expect(await almacen.disponible()).toBe(true);
+    await almacen.guardar({ message_id: 'recuperado', intento: 1, clinica_id: 1, conversacion_id: 1, creado_en: new Date().toISOString() });
+    expect(await almacen.deConversacion(1, 1)).toHaveLength(1);
+    await almacen.cerrar();
+    await new Promise((resolver) => puente.close(resolver));
+  }, 20_000);
 });

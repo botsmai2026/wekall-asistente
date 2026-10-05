@@ -8,7 +8,7 @@ import type { BaseDeDatos } from '../infraestructura/postgres.js';
 import type { Reloj } from '../infraestructura/reloj.js';
 import type { GeneradorEmbeddings, ModeloLenguaje } from './puertos.js';
 import type { CitaParaMostrar } from '../dominio/plantillas.js';
-import type { FechaLocal } from '../dominio/fechas.js';
+import type { FechaLocal, Franja } from '../dominio/fechas.js';
 import type { TipoRespuesta } from '../dominio/estados.js';
 import { LIMITE_TRANSACCION_MS } from '../infraestructura/postgres.js';
 
@@ -79,7 +79,7 @@ export class MemoriaIntento {
   fragmentosVistos = 0;
   /** Búsquedas de conocimiento completadas en este intento. */
   busquedas = 0;
-  ultimaConsulta: { especialidad: string; sede: string | null; fecha: FechaLocal; vacia: boolean } | null = null;
+  ultimaConsulta: { especialidad: string; sede: string | null; fecha: FechaLocal; franja: Franja | null; vacia: boolean } | null = null;
   citaCreada: CitaParaMostrar | null = null;
   /**
    * El paciente eligió un horario y no se pudo agendar (ocupado, pasado o inválido).

@@ -44,6 +44,20 @@ Dos detalles del ejemplo:
 
 Sin `OPENAI_API_KEY`, las bases, la API y la interfaz arrancan igual, pero el worker no: los mensajes quedan en cola y nadie los responde.
 
+### Mensajes para probar los casos borde
+
+Desde el simulador de la interfaz, con un teléfono distinto para cada caso. El texto de cada respuesta lo escribe el código; qué herramienta usar lo decide el modelo, así que lo descrito es lo observado con `gpt-4o-mini`.
+
+| Mensaje | Qué debe pasar |
+|---|---|
+| `¿Cuánto cuesta una resonancia magnética?` | Busca en los documentos, no encuentra respaldo y responde que no tiene esa información. No inventa un precio |
+| `Hola, ¿tienen cita con dermatología mañana en la tarde?` y luego `2` | Ofrece horarios numerados del día siguiente, en hora de Colombia y solo desde el mediodía. Con `2` agenda exactamente la segunda opción de esa lista |
+| `¿Tienen cita de dermatología el sábado en la tarde?` | El sábado solo se atiende en la mañana: responde que no hay horarios en la tarde y ofrece buscar en otro momento |
+| `Quiero una cita de medicina general mañana`, luego `mejor otro día` y luego `el 5` | Tras la oferta pregunta la fecha. `el 5` se toma como fecha, no como la opción 5 de la lista anterior |
+| `Quiero hablar con una persona` | Escala la conversación: queda en estado "Escalada" y los mensajes siguientes reciben una respuesta fija |
+
+Para la idempotencia, envíe dos veces el mismo cuerpo al webhook (el ejemplo de arriba): las dos responden 202 y el mensaje se procesa una sola vez. El mismo `message_id` con otro texto responde 409.
+
 ## Tests
 
 No usan el modelo real ni Mongo. Usan PostgreSQL real, con el mismo esquema y las mismas sentencias SQL que la aplicación.
@@ -94,6 +108,7 @@ python3 verificacion/verificar.py --dsn "host=localhost port=5432 user=postgres 
 | `tests/` | Tests de la aplicación |
 | `verificacion/` | Verificador de la capa de PostgreSQL y sus resultados |
 | `docs/` | Arquitectura, decisión sobre la cola y diseño en AWS |
+| `infra/terraform/` | Terraform de la base del diseño en AWS (red, PostgreSQL, cola de envío, secretos, logs). No está desplegado; su README explica cómo validarlo sin una cuenta de AWS |
 
 ## API
 
@@ -114,7 +129,7 @@ Clínica Valle Salud, con 2 sedes (Norte y Sur), 3 especialidades (Medicina gene
 | Parte | Estado |
 |---|---|
 | Esquema, cola, bloqueos, concurrencia, citas, outbox, búsqueda vectorial | Probado por `verificacion/verificar.py` contra PostgreSQL 16 con pgvector: 159 de 159 comprobaciones. La salida completa está en `verificacion/resultado.txt` |
-| Webhook, worker, herramientas, fechas, plantillas, ingestión, relevo, API | Probado por `npm test` contra PostgreSQL real, con modelo y embeddings falsos: 176 tests |
+| Webhook, worker, herramientas, fechas, plantillas, ingestión, relevo, API | Probado por `npm test` contra PostgreSQL real, con modelo y embeddings falsos: 181 tests |
 | Adaptador de OpenAI | Probado sin red: qué envía y cómo clasifica los errores. Ejecutado contra la API real con `gpt-4o-mini` y `text-embedding-3-small`. Los errores del proveedor (429, 5xx, clave inválida) no se han provocado contra la API real |
 | Comportamiento del modelo real con el prompt y las herramientas | Probado a mano con `gpt-4o-mini`, en pocas conversaciones: pregunta con y sin respuesta en los documentos, agendamiento por opción, cambio de fecha después de una oferta, pregunta intercalada entre la oferta y la elección, nueva oferta cuando otro paciente toma un horario, y escalamiento. No hay un conjunto de evaluación ni se ha probado otro modelo. Lo observado, con dos fallos que se corrigieron, está en `DECISIONS.md`, sección 5 |
 | Umbral de similitud (`UMBRAL_SIMILITUD`, 0,3) | Sin calibrar. Con embeddings reales solo hay unas pocas búsquedas observadas (`DECISIONS.md`, sección 3.8) |

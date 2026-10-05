@@ -13,19 +13,47 @@ import { TrazaRechazada, type AlmacenTrazas, type DocumentoTraza } from '../apli
 const LIMITE_MS = 3000; // tiempo máximo de cualquier operación, incluida la conexión
 
 export class AlmacenTrazasMongo implements AlmacenTrazas {
-  private constructor(private readonly cliente: MongoClient, private readonly coleccion: Collection<DocumentoTraza>) {}
+  private cliente!: MongoClient;
+  private coleccion!: Collection<DocumentoTraza>;
+
+  private constructor(private readonly url: string, private readonly base: string) {
+    this.abrir();
+  }
 
   static crear(url: string, base: string): AlmacenTrazasMongo {
+    return new AlmacenTrazasMongo(url, base);
+  }
+
+  private abrir(): void {
     // No se conecta aquí: el driver conecta en la primera operación. Así, que
     // Mongo esté caído al arrancar no impide que la API ni el worker arranquen.
-    const cliente = new MongoClient(url, {
+    this.cliente = new MongoClient(this.url, {
       serverSelectionTimeoutMS: LIMITE_MS,
       timeoutMS: LIMITE_MS,
       // La fila del outbox solo se borra tras una escritura confirmada en disco.
       writeConcern: { w: 'majority', journal: true },
       retryWrites: false,
     });
-    return new AlmacenTrazasMongo(cliente, cliente.db(base).collection<DocumentoTraza>('trazas_intento'));
+    this.coleccion = this.cliente.db(this.base).collection<DocumentoTraza>('trazas_intento');
+  }
+
+  /**
+   * Tras un fallo que no es una respuesta de Mongo (no se pudo conectar, se cortó,
+   * no contestó a tiempo), se descarta el cliente y se abre otro para la siguiente
+   * operación.
+   *
+   * Por qué: si la PRIMERA conexión de un cliente falla, el driver deja ese cliente
+   * cerrado y todas sus operaciones siguientes fallan al instante con "Topology is
+   * closed", aunque Mongo ya esté arriba. Ocurrió al arrancar la API unos segundos
+   * antes que Mongo: quedó sin poder leer trazas hasta reiniciar el proceso.
+   *
+   * `usado` es el cliente con el que se hizo la operación que falló: si otra
+   * operación ya lo reemplazó, no se toca el nuevo.
+   */
+  private renovarSiHaceFalta(causa: unknown, usado: MongoClient): void {
+    if (causa instanceof MongoServerError || usado !== this.cliente) return;
+    this.abrir();
+    void usado.close().catch(() => {});
   }
 
   private indicesListos = false;
@@ -46,12 +74,14 @@ export class AlmacenTrazasMongo implements AlmacenTrazas {
   }
 
   async guardar(traza: DocumentoTraza): Promise<void> {
+    const cliente = this.cliente;
     try {
       await this.prepararIndices();
       await this.coleccion.insertOne({ ...traza });
     } catch (causa) {
       if (causa instanceof MongoServerError && causa.code === 11000) return; // ya estaba: éxito
       if (esRechazoDelDocumento(causa)) throw new TrazaRechazada(String((causa as Error).message));
+      this.renovarSiHaceFalta(causa, cliente);
       throw new ErrorInfraestructura('Mongo no respondió', causa);
     }
   }
@@ -62,19 +92,23 @@ export class AlmacenTrazasMongo implements AlmacenTrazas {
 
   async deConversacion(clinicaId: number, conversacionId: number): Promise<DocumentoTraza[]> {
     if (Date.now() < this.lecturasSuspendidasHasta) throw new ErrorInfraestructura('Mongo no respondió hace un momento');
+    const cliente = this.cliente;
     try {
       return await this.coleccion.find({ clinica_id: clinicaId, conversacion_id: conversacionId }, { projection: { _id: 0 } }).sort({ creado_en: 1 }).toArray();
     } catch (causa) {
       this.lecturasSuspendidasHasta = Date.now() + 5000;
+      this.renovarSiHaceFalta(causa, cliente);
       throw new ErrorInfraestructura('Mongo no respondió', causa);
     }
   }
 
   async disponible(): Promise<boolean> {
+    const cliente = this.cliente;
     try {
-      await this.cliente.db('admin').command({ ping: 1 });
+      await cliente.db('admin').command({ ping: 1 });
       return true;
-    } catch {
+    } catch (causa) {
+      this.renovarSiHaceFalta(causa, cliente);
       return false;
     }
   }

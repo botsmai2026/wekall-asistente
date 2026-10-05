@@ -1,0 +1,9 @@
+# Proveedores que descarga "terraform init" y estado local: no van al repositorio.
+# El archivo de bloqueo (.terraform.lock.hcl) sí: fija las versiones y huellas de los proveedores.
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+# Los valores de las variables de cada despliegue tampoco: pueden ser propios de una cuenta.
+*.tfvars
+!*.tfvars.example
