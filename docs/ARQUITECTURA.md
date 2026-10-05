@@ -319,7 +319,33 @@ Dos relojes:
 - **Hora del mensaje (`enviado_en`):** define "hoy" para interpretar la referencia, y nada más. No decide el orden de procesamiento: eso lo hace la secuencia que asigna el servidor. Así, quien envía no puede adelantarse en la cola declarando una hora antigua, y el historial muestra los mensajes en el orden en que el asistente realmente los vio.
 - **Reloj real:** rechaza fechas y horarios pasados.
 
-El código valida formato, que la fecha no sea pasada y que esté dentro del horizonte de la agenda. La franja `mañana` es antes de las 12:00 hora local; `tarde`, desde las 12:00.
+Orden en `consultar_disponibilidad`:
+
+1. **Resolver la referencia del modelo** (`resolverReferencia`). Convierte la forma que eligió el modelo en un día del calendario. "Hoy" es el día que marca la hora del mensaje en la zona horaria de la clínica.
+2. **Contrastarla con el mensaje** (`contrastarConMensaje`). Si el paciente escribió un día de la semana, manda lo que escribió (ver abajo).
+3. **Validar la fecha resultante** (`validarFecha`) contra el reloj real: no puede ser pasada ni estar fuera del horizonte de la agenda. Con esa fecha se arman el rango de la consulta, la oferta y sus textos.
+
+**Contraste con el día de la semana escrito.** El esquema acepta "el sábado" de tres formas, y en dos de ellas (`dia_mes` y `dias_desde_hoy`) el modelo cuenta él mismo. En la aceptación con el modelo real contó mal: "el sábado" llegó como miércoles 7; "el viernes", como jueves 8; "No, quiero el viernes", como el viernes de la semana siguiente.
+
+Por eso el código lee el mensaje actual con una gramática deliberadamente conservadora. No es un parser de fechas:
+
+- Un día de la semana cuenta solo detrás de "el", "este" o "próximo". "Con el doctor Domingo", "un sábado", "los sábados" o "el otro viernes" no cuentan, y la fecha queda como la pidió el modelo.
+- "el", "este" y "próximo" significan lo mismo: la próxima ocurrencia, sin contar hoy. Solo una expresión explícita lleva a la semana calendario siguiente: "de la otra semana", "de la semana que viene", "de la siguiente semana", "de la próxima semana".
+- También cuentan como fechas escritas "hoy", "mañana" (no "la mañana" ni "esta mañana", que son partes del día), "pasado mañana" y un día en número ("viernes 16", "el 16", "16 de octubre"). "A las 8" u "8:30" no cuentan.
+- No interpreta negaciones ni mira mensajes anteriores.
+
+| Mensaje del paciente | Qué decide el código |
+|---|---|
+| No nombra un día de la semana | Vale la fecha del modelo |
+| Una sola fecha escrita | Vale la del paciente. Si el modelo pidió otra, se consulta la del mensaje y la traza guarda la del modelo en `fecha_modelo` |
+| Varias fechas escritas ("¿mañana o el miércoles?", "el viernes 16") | Vale la del modelo si es una de ellas. Si no, la herramienta devuelve `fecha_no_coincide` y el modelo consulta una de las fechas escritas o pregunta |
+
+Ejemplos (cubiertos por `tests/fechas.test.ts`):
+
+- Escrito el lunes 5 de octubre: "el viernes" → viernes 9; "este viernes" → viernes 9; "el próximo viernes" → viernes 9; "el viernes de la otra semana" → viernes 16.
+- Escrito el viernes 9 de octubre: "el viernes" → viernes 16; "este viernes" → viernes 16; "el próximo viernes" → viernes 16.
+
+La franja `mañana` es antes de las 12:00 hora local; `tarde`, desde las 12:00.
 
 Expresiones fuera de las tres formas ("a fin de mes", "en dos semanas"), o un "mejor otro día" sin decir cuál, no tienen salida calculada por el modelo: debe pedir una fecha concreta con `pregunta_aclaratoria`, sin elegirla ni probar varias fechas. Defensas adicionales: la herramienta devuelve la fecha que consultó, y el paciente ve la fecha explícita antes de confirmar.
 

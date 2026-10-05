@@ -177,6 +177,50 @@ describe('agendamiento', () => {
     expect(llamadas[1].resultado.fecha_consultada).toBe('sábado 10 de octubre de 2026');
   });
 
+  it('si el paciente escribió un día de la semana, se consulta ese día aunque el modelo cuente mal', async () => {
+    // Los argumentos que mandó el modelo real en la ronda de aceptación, escrito el lunes 5 de octubre.
+    await e.enviar('¿Tienen cita de dermatología el sábado en la tarde?', 'm1');
+    await procesarUno(e.con(
+      { herramienta: 'consultar_disponibilidad', argumentos: { especialidad: 'Dermatología', fecha: { dia: 7, mes: 10 }, franja: 'tarde' } },
+      responder({ tipo: 'sin_disponibilidad' }),
+    ));
+    expect((await mensaje('m1')).respuesta_texto).toBe('No hay horarios disponibles de Dermatología para el sábado 10 de octubre de 2026 en la tarde. Si lo desea, puedo buscar en otro momento del día o en otra fecha.');
+    const consulta = (await trazas('m1'))[0].llamadas[0];
+    expect(consulta.real.fecha).toEqual({ anio: 2026, mes: 10, dia: 10 });
+    expect(consulta.real.fecha_modelo).toEqual({ anio: 2026, mes: 10, dia: 7 }); // la traza conserva lo que pidió el modelo
+  });
+
+  it('"el viernes" mal contado se corrige, y la reserva sale de la oferta del viernes', async () => {
+    const medicinaGeneral = (fecha: object): Paso => ({ herramienta: 'consultar_disponibilidad', argumentos: { especialidad: 'Medicina general', fecha } });
+    const ofrecerTodo: Paso = (mensajes) => responder({ tipo: 'oferta_horarios', horarios: ultimoResultado(mensajes).horarios.map((h: any) => h.etiqueta) });
+    await e.enviar('Quiero otra cita de medicina general el viernes', 'm1');
+    await procesarUno(e.con(medicinaGeneral({ dias_desde_hoy: 3 }), ofrecerTodo));
+    expect((await mensaje('m1')).respuesta_texto.split('\n')[0]).toBe('Horarios de Medicina general para el viernes 9 de octubre de 2026:');
+
+    await e.enviar('No, quiero el viernes', 'm2');
+    await procesarUno(e.con(medicinaGeneral({ dia_semana: 'viernes', semana_siguiente: true }), ofrecerTodo));
+    const oferta = await mensaje('m2');
+    expect(oferta.respuesta_texto.split('\n')[0]).toBe('Horarios de Medicina general para el viernes 9 de octubre de 2026:');
+
+    await e.enviar('1', 'm3');
+    await procesarUno(e.con(agendar(1), confirmar));
+    expect((await citas()).map((c) => c.slot_id)).toEqual([Number(oferta.oferta_slots[0])]);
+    expect((await mensaje('m3')).respuesta_texto).toContain('el viernes 9 de octubre de 2026');
+  });
+
+  it('con dos fechas escritas, una tercera vuelve al modelo como error', async () => {
+    await e.enviar('¿mañana o el miércoles?', 'm1');
+    await procesarUno(e.con(
+      { herramienta: 'consultar_disponibilidad', argumentos: { especialidad: 'Medicina general', fecha: { dia: 9, mes: 10 } } },
+      { herramienta: 'consultar_disponibilidad', argumentos: { especialidad: 'Medicina general', fecha: { dia_semana: 'miercoles' } } },
+      (mensajes) => responder({ tipo: 'oferta_horarios', horarios: [ultimoResultado(mensajes).horarios[0].etiqueta] }),
+    ));
+    const llamadas = (await trazas('m1'))[0].llamadas;
+    expect(llamadas[0].resultado.error).toBe('fecha_no_coincide');
+    expect(llamadas[1].resultado.fecha_consultada).toBe('miércoles 7 de octubre de 2026');
+    expect(llamadas[1].real.fecha_modelo).toBeUndefined(); // el modelo pidió una de las fechas escritas: nada que corregir
+  });
+
   it('una consulta sin horarios permite "sin_disponibilidad"; con horarios, no', async () => {
     await e.enviar('dermatología el domingo', 'm1');
     await procesarUno(e.con(

@@ -106,6 +106,59 @@ export function validarFecha(fecha: FechaLocal, hoyReal: FechaLocal, horizonteDi
   return null;
 }
 
+// --------------------------------------------------------------------------
+// La fecha que escribió el paciente
+// --------------------------------------------------------------------------
+// El esquema acepta "el sábado" de tres formas, y en dos de ellas ({dia, mes} y
+// dias_desde_hoy) el modelo cuenta él mismo. En la ronda de aceptación contó
+// mal: "el sábado" → miércoles 7; "el viernes" → 3 días (jueves 8). Por eso,
+// si el mensaje nombra un día de la semana, el código contrasta la fecha del
+// modelo con lo que escribió el paciente.
+//
+// Gramática cerrada, como la de la selección: solo el mensaje actual, sin
+// negaciones ni contexto. Un día de la semana cuenta solo detrás de "el",
+// "este" o "próximo" ("con el doctor Domingo" no es un día). Los tres
+// significan lo mismo que dia_semana sin semana_siguiente: la próxima vez que
+// ocurra, sin contar hoy. La semana calendario siguiente solo la activa una
+// expresión explícita: "de la otra semana", "de la semana que viene"…
+const DIA_ESCRITO = /\b(?:el|este|proximo) (lunes|martes|miercoles|jueves|viernes|sabado|domingo)\b/g;
+const SEMANA_SIGUIENTE = /\b(?:otra|proxima|siguiente|entrante) semana\b|\bsemana (?:que viene|siguiente|entrante|proxima)\b/;
+// Otras fechas del mismo mensaje. "mañana" es un día salvo en "la mañana" o "esta mañana", que son partes del día.
+const DIAS_RELATIVOS: [RegExp, number][] = [[/\bhoy\b/, 0], [/(?<!\b(?:la|esta|pasado) )\bmanana\b/, 1], [/\bpasado manana\b/, 2]];
+// Un día escrito en número: "viernes 16", "el 16". No "8:30", que es una hora.
+const DIA_EN_NUMERO = /\b(?:lunes|martes|miercoles|jueves|viernes|sabado|domingo|el) (\d{1,2})\b(?!:)/g;
+
+export type Contraste = { fecha: FechaLocal; corregida: boolean } | { error: 'fecha_no_coincide' };
+
+/**
+ * Contrasta la fecha que pidió el modelo con el mensaje del paciente.
+ * - Sin un día de la semana escrito: vale la del modelo; no se interviene.
+ * - Un día de la semana y ninguna otra fecha: vale la del mensaje.
+ * - Varias fechas ("¿mañana o el miércoles?", "el viernes 16"): vale la del
+ *   modelo si es una de ellas. Si no, error: el código no sabe cuál quiso el
+ *   paciente, así que no elige por él.
+ */
+export function contrastarConMensaje(delModelo: FechaLocal, texto: string, hoy: FechaLocal): Contraste {
+  const t = normalizarDiaSemana(texto).replace(/[^a-z0-9:]+/g, ' ');
+  const dias = new Set([...t.matchAll(DIA_ESCRITO)].map((m) => m[1] as DiaSemana));
+  if (dias.size === 0) return { fecha: delModelo, corregida: false };
+
+  const semanaSiguiente = SEMANA_SIGUIENTE.test(t);
+  const candidatas = [...dias].map((dia) => resolverReferencia({ dia_semana: dia, semana_siguiente: semanaSiguiente }, hoy) as FechaLocal);
+  for (const [patron, desdeHoy] of DIAS_RELATIVOS) if (patron.test(t)) candidatas.push(sumarDias(hoy, desdeHoy));
+  const escritas = candidatas.filter((f, i) => candidatas.findIndex((g) => compararFechas(f, g) === 0) === i);
+  // De un día en número solo se sabe el día ("el 16") o el día y el mes ("16 de octubre").
+  const numeros: { dia: number; mes: number | null }[] = [...t.matchAll(DIA_EN_NUMERO)].map((m) => ({ dia: Number(m[1]), mes: null }));
+  for (const m of t.matchAll(new RegExp(`\\b(\\d{1,2}) de (${MESES.join('|')})\\b`, 'g'))) numeros.push({ dia: Number(m[1]), mes: MESES.indexOf(m[2]!) + 1 });
+
+  if (escritas.length === 1 && numeros.length === 0) {
+    return { fecha: escritas[0]!, corregida: compararFechas(escritas[0]!, delModelo) !== 0 };
+  }
+  const coincide = escritas.some((f) => compararFechas(f, delModelo) === 0)
+    || numeros.some((n) => n.dia === delModelo.dia && (n.mes === null || n.mes === delModelo.mes));
+  return coincide ? { fecha: delModelo, corregida: false } : { error: 'fecha_no_coincide' };
+}
+
 /** El instante (UTC) que corresponde a una fecha y hora locales en la zona indicada. */
 export function instanteDe(fecha: FechaLocal, hora: number, zona: string): Date {
   // Se parte de suponer que la hora local es UTC y se corrige con el desfase de

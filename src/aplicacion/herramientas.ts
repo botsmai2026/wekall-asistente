@@ -15,7 +15,7 @@ import { Kind, Type, TypeRegistry, type TSchema } from '@sinclair/typebox';
 import { Value } from '@sinclair/typebox/value';
 import { ErrorLogico } from '../dominio/errores.js';
 import {
-  DIAS_SEMANA, escribirFecha, escribirHora, fechaLocalDe, normalizarDiaSemana, rangoDelDia, resolverReferencia, validarFecha,
+  contrastarConMensaje, DIAS_SEMANA, escribirFecha, escribirHora, fechaLocalDe, normalizarDiaSemana, rangoDelDia, resolverReferencia, validarFecha,
   type Franja, type ReferenciaFecha,
 } from '../dominio/fechas.js';
 import { extraerPosicion } from '../dominio/seleccion.js';
@@ -245,8 +245,14 @@ async function consultarDisponibilidad(
   const { base, reloj, limites } = deps;
   // "Hoy" para interpretar la referencia es el día en que el paciente escribió.
   const hoyDelMensaje = fechaLocalDe(contexto.enviadoEn, contexto.zona);
-  const fecha = resolverReferencia(a.fecha, hoyDelMensaje);
-  if ('error' in fecha) return error(fecha.error, 'Esa fecha no existe. Pide al paciente una fecha concreta.');
+  const delModelo = resolverReferencia(a.fecha, hoyDelMensaje);
+  if ('error' in delModelo) return error(delModelo.error, 'Esa fecha no existe. Pide al paciente una fecha concreta.');
+  // Si el paciente nombró un día de la semana, la fecha sale de lo que escribió, no de la cuenta del modelo.
+  const contraste = contrastarConMensaje(delModelo, contexto.texto, hoyDelMensaje);
+  if ('error' in contraste) {
+    return error('fecha_no_coincide', `El ${escribirFecha(delModelo)} no es ninguna de las fechas que escribió el paciente. Consulta una de ellas, o pide una fecha concreta con pregunta_aclaratoria.`);
+  }
+  const fecha = contraste.fecha;
   // Pasado o futuro lo decide el reloj real, no la hora que declara el mensaje.
   const ahora = reloj.ahora();
   const problema = validarFecha(fecha, fechaLocalDe(ahora, contexto.zona), limites.horizonteAgendaDias);
@@ -274,7 +280,7 @@ async function consultarDisponibilidad(
 
   return {
     resultado: { fecha_consultada: escribirFecha(fecha), especialidad: especialidad.nombre, horarios },
-    real: { fecha, desde, hasta, especialidad_id: especialidad.id, sede_id: sede?.id ?? null, slots: filas.map((f) => f.id) },
+    real: { fecha, ...(contraste.corregida ? { fecha_modelo: delModelo } : {}), desde, hasta, especialidad_id: especialidad.id, sede_id: sede?.id ?? null, slots: filas.map((f) => f.id) },
   };
 }
 

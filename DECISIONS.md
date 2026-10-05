@@ -22,7 +22,7 @@ Lo que ejecuté yo, en mi equipo, el 4 de octubre de 2026 y con mi clave de Open
 
 Lo que ejecutaron asistentes de IA sobre el repositorio, en mi equipo, y cuyos reportes revisé:
 
-- Los tests de la aplicación: 181 de 181 con PostgreSQL y MongoDB reales. Sin MongoDB se omiten 4 y pasan 177.
+- Los tests de la aplicación: 191 de 191 con PostgreSQL y MongoDB reales, después de agregar la defensa de días de la semana (sección 3.7). La ejecución sin MongoDB no se repitió: en la anterior, con 181 tests, se omitieron 4 y pasaron 177.
 - El verificador de la base de datos: 159 de 159 comprobaciones, con pgvector. La salida está en `verificacion/resultado.txt`.
 - El arranque desde volúmenes vacíos y la prueba con MongoDB detenido: el paciente recibió su respuesta, la traza se pudo leer desde PostgreSQL y pasó a Mongo al volver.
 - La validación final con `gpt-4o-mini`, que repitió los flujos de elección sobre una oferta de horarios y encontró dos fallos que los tests no cubrían (sección 5).
@@ -123,7 +123,16 @@ El modelo nunca escribe una fecha. Dice a qué se refiere el paciente ("días de
 El caso de la prueba es un test: un mensaje a las 03:40 UTC del 6 de octubre es, en Cali, el 5 a las 10:40 p. m., y "mañana" es el 6. La hora del mensaje define "hoy"; el reloj del servidor decide si la fecha ya pasó.
 
 - **Costo aceptado.** Expresiones como "a fin de mes" no tienen salida: el asistente pide una fecha concreta.
-- **Límite.** En "días desde hoy" el número lo pone el modelo, y si cuenta mal el código no puede saberlo. Ocurrió una vez con el modelo real, después de que el código le rechazara un día de la semana bien escrito (sección 5). La defensa que queda es que el paciente lee la fecha completa en la oferta antes de elegir.
+- **Lo que encontró la aceptación con el modelo real.** El esquema acepta un día de la semana de tres formas, y en dos de ellas el modelo cuenta él mismo. Contó mal tres veces: "el sábado" llegó como `{dia: 7, mes: 10}` (un miércoles); "el viernes", como `dias_desde_hoy: 3` (un jueves); y "No, quiero el viernes", con `semana_siguiente: true` (el viernes de la semana siguiente). Las tres eran fechas válidas y el código las aceptaba.
+- **La defensa.** Ahora el código contrasta el día de la semana que escribió el paciente con la fecha que propone el modelo, antes de `validarFecha` (`contrastarConMensaje`, en `src/dominio/fechas.ts`):
+  - La gramática es deliberadamente estrecha: solo el mensaje actual, un día de la semana solo detrás de "el", "este" o "próximo", la semana siguiente solo con una expresión explícita ("de la otra semana"), y sin interpretar negaciones.
+  - Si el mensaje tiene una única fecha explícita, manda la que escribió el paciente.
+  - Si tiene varias referencias válidas ("¿mañana o el miércoles?"), la fecha del modelo debe ser una de ellas. Si no lo es, la herramienta devuelve `fecha_no_coincide` y el modelo consulta otra o pregunta.
+  - Cuando el código corrige la fecha, la traza conserva la que pidió el modelo en `fecha_modelo`.
+  - No cambiaron las ofertas, la reserva, la concurrencia, el SQL ni el prompt.
+
+  Es la idea de la sección 2 aplicada a las fechas: el código responde por el resultado, no el modelo.
+- **Límite.** Si el mensaje no nombra un día de la semana ("en tres días", o el día se dijo en un mensaje anterior), el número lo pone el modelo, y si cuenta mal el código no puede saberlo. La defensa que queda es que el paciente lee la fecha completa en la oferta antes de elegir.
 
 ### 3.8 Conocimiento (RAG) y base vectorial
 
@@ -133,7 +142,11 @@ Uso pgvector dentro del mismo PostgreSQL, con búsqueda exacta.
 - **Por qué búsqueda exacta y no un índice aproximado.** La consulta se midió: 2 ms con 200 fragmentos en una clínica, 40 ms con 5.000. Un índice aproximado puede perder un fragmento relevante, y aquí eso aumenta el riesgo de un "no tengo esa información" falso. Con el tamaño actual la búsqueda exacta cumple la latencia y evita ese costo.
 - **El texto vive en un solo lugar,** línea por línea. Los fragmentos que se buscan no guardan texto: apuntan a un rango de líneas. Lo que recibe el paciente no puede diferir del documento.
 - **"No tengo esa información" exige haber buscado** en ese mismo turno.
-- **Sin calibrar:** el umbral de similitud (0,3) es provisional. Los tests lo prueban con embeddings de prueba. Con embeddings reales solo hay unas pocas búsquedas observadas, sobre dos preguntas: la sección que responde obtuvo entre 0,64 y 0,68 y la siguiente unos 0,44; una pregunta sin respuesta en los documentos trajo fragmentos de 0,30 a 0,40, y fue el modelo quien eligió "no tengo esa información". Orienta, pero no es una calibración.
+- **Umbral de similitud (0,3): medido y conservado.** Se midió con los documentos y los embeddings reales: 48 preguntas, cada una en dos formas (como la escribe el paciente y como consulta corta), 96 búsquedas reales. Entre ellas había preguntas con respuesta en las mismas palabras del documento, con respuesta en otras palabras, sin respuesta, y sin respuesta pero con todas sus palabras presentes en los documentos.
+  - Ningún umbral separa los dos grupos. Subirlo a 0,44 reduce de 29 a 17 (de 32) las búsquedas sin respuesta que reciben fragmentos, pero bloquea consultas válidas como "¿Abren los domingos?" (0,38, por debajo de "¿Cuánto cuesta una resonancia magnética?", 0,40).
+  - Las defensas léxicas e híbridas medidas (cobertura de términos, términos ausentes del corpus, similitud alta o evidencia léxica, sinónimos por embeddings) también rompieron consultas válidas. La de menos errores en total rompió 8 de 64 y aun dejaba pasar 7 de 32 búsquedas sin respuesta, justo las preguntas cuyas palabras sí están en los documentos.
+  - Por eso en esta entrega se conserva el comportamiento actual. Es una limitación medida y una decisión consciente: no se introduce una heurística que no demostró ser robusta. Un fragmento parecido no obliga a responder, porque el modelo elige las líneas y puede contestar "no tengo esa información". Esa elección es la parte no garantizada: ante la pregunta de la resonancia, en la aceptación lo hizo en una de tres ejecuciones, y en las otras dos citó las tarifas de consulta.
+  - La mejora correcta es una etapa explícita de verificación de pertinencia, o conocimiento estructurado para los datos críticos (precios, duraciones, servicios).
 - **Límite conocido:** la ingestión supone un solo proceso por documento. Dos a la vez sobre el mismo documento pierden una versión.
 
 ### 3.9 Cuando el modelo falla
